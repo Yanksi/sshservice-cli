@@ -22,24 +22,33 @@ import requests
 import os
 import sys
 import time
-import re
 import json
-from progress.bar import IncrementalBar
+import pyotp
+from pathlib import Path
+# from progress.bar import IncrementalBar
 
 #Variables:
 api_get_keys = 'https://sshservice.cscs.ch/api/v1/auth/ssh-keys/signed-key'
+ssh_folder = Path(os.path.expanduser("~")) / '.ssh'
+time_stamp = int(time.time())
+priv_key_name = 'cscs-key'
 
 #Methods:
-def get_user_credentials():
-    user = input("Username: ")
-    pwd = getpass.getpass()
-    otp = getpass.getpass("Enter OTP (6-digit code):")
-    if not (re.match('^\d{6}$', otp)):
-       sys.exit("Error: OTP must be a 6-digit code.")
+def get_user_credentials(fname=None):
+    credentials = {}
+    if fname is not None and os.path.exists(fname):
+        print("Reading credentials from file: " + fname)
+        with open(fname, 'r') as f:
+            credentials = json.load(f)
+            if 'otp_secret' in credentials:
+                credentials['otp'] = pyotp.TOTP(credentials['otp_secret']).now()
+    user = input("Username: ") if 'username' not in credentials else credentials['username']
+    pwd = getpass.getpass() if 'password' not in credentials else credentials['password']
+    otp = getpass.getpass("Enter OTP (6-digit code):") if 'otp' not in credentials else credentials['otp']
     return user, pwd, otp
 
-
 def get_keys(username, password, otp):
+    print("Fetching keys from CSCS...")
     headers = {'Content-Type': 'application/json', 'Accept':'application/json'}
     data = {
         "username": username,
@@ -75,6 +84,7 @@ def save_keys(public,private):
     except IOError as er:
         sys.exit('Error: writing public key failed.', er)
     try:
+        private = f"{private}\ntime stamp: {time_stamp}"
         with open(os.path.expanduser("~")+'/.ssh/cscs-key', 'w') as file:
             file.write(private)
     except IOError as er:
@@ -103,38 +113,38 @@ def set_passphrase():
         print("Please set the same passphrase twice...")
     return passphrase
 
+def key_valid(priv_key_f):
+    if not priv_key_f.exists():
+        return False
+    with open(priv_key_f, 'r') as f:
+        lines = f.readlines()
+        if lines[-1].startswith("time stamp:"):
+            timestamp = int(lines[-1].split()[-1])
+            return (time_stamp - timestamp) < 86400 # 1 day
+    return False
 
-def main():
-    user, pwd, otp = get_user_credentials()
-    bar = IncrementalBar('Retrieving signed SSH keys:', max = 3)
+def main(credentials_file=None):
+    if key_valid(ssh_folder / priv_key_name):
+        print("Keys are still valid.")
+        return
+    user, pwd, otp = get_user_credentials(credentials_file)
     public, private = get_keys(user, pwd, otp)
-    bar.next()
-    time.sleep(1)
-    bar.next()
-    time.sleep(1)
     save_keys(public, private)
-    bar.next()
-    time.sleep(1)
-    bar.finish()
-    if (set_passphrase()):
-        substrg = ", using the passphrase you have set:"
-    else:
-        substrg = ":"
-    message = """        
+#     message = """        
 
-Usage:
+# Usage:
 
-1. Add the key to the SSH agent"""+substrg+"""
-ssh-add -t 1d ~/.ssh/cscs-key
+# 1. Add the key to the SSH agent"""+substrg+"""
+# ssh-add -t 1d ~/.ssh/cscs-key
 
-2. Connect to the login node using CSCS keys:
-ssh -A your_usernamen@<CSCS-LOGIN-NODE>
+# 2. Connect to the login node using CSCS keys:
+# ssh -A your_usernamen@<CSCS-LOGIN-NODE>
 
-Note - if the key is not added to the SSH agent as mentioned in the step-1 above then use the command:
-ssh -i ~/.ssh/cscs-key <CSCS-LOGIN-NODE>
+# Note - if the key is not added to the SSH agent as mentioned in the step-1 above then use the command:
+# ssh -i ~/.ssh/cscs-key <CSCS-LOGIN-NODE>
 
-"""
-    print(message)
+# """
+#     print(message)
 
 if __name__ == "__main__":
-    main()
+    main("credential.json")
