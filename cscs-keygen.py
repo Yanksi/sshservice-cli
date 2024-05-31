@@ -36,8 +36,8 @@ priv_key_name = 'cscs-key'
 #Methods:
 def get_user_credentials(fname=None):
     credentials = {}
-    if fname is not None and os.path.exists(fname):
-        print("Reading credentials from file: " + fname)
+    if fname is not None and fname.exists():
+        print("Reading credentials from file: " + str(fname))
         with open(fname, 'r') as f:
             credentials = json.load(f)
             if 'otp_secret' in credentials:
@@ -147,4 +147,4 @@ def main(credentials_file=None):
 #     print(message)
 
 if __name__ == "__main__":
-    main("credential.json")
+    main(Path(__file__).parent / 'credential.json')
