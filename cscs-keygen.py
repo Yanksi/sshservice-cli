@@ -84,7 +84,6 @@ def save_keys(public,private):
     except IOError as er:
         sys.exit('Error: writing public key failed.', er)
     try:
-        private = f"{private}\ntime stamp: {time_stamp}"
         with open(os.path.expanduser("~")+'/.ssh/cscs-key', 'w') as file:
             file.write(private)
     except IOError as er:
@@ -116,12 +115,8 @@ def set_passphrase():
 def key_valid(priv_key_f):
     if not priv_key_f.exists():
         return False
-    with open(priv_key_f, 'r') as f:
-        lines = f.readlines()
-        if lines[-1].startswith("time stamp:"):
-            timestamp = int(lines[-1].split()[-1])
-            return (time_stamp - timestamp) < 86400 # 1 day
-    return False
+    modified_time = int(os.path.getmtime(priv_key_f))
+    return (time_stamp - modified_time) < 86400 # 1 day
 
 def main(credentials_file=None):
     if key_valid(ssh_folder / priv_key_name):
