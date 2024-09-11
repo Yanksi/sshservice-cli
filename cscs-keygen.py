@@ -121,10 +121,11 @@ def key_valid(priv_key_f):
 def main(credentials_file=None):
     if key_valid(ssh_folder / priv_key_name):
         print("Keys are still valid.")
-        return
+        return 1
     user, pwd, otp = get_user_credentials(credentials_file)
     public, private = get_keys(user, pwd, otp)
     save_keys(public, private)
+    return 0
 #     message = """        
 
 # Usage:
@@ -142,4 +143,4 @@ def main(credentials_file=None):
 #     print(message)
 
 if __name__ == "__main__":
-    main(Path(__file__).parent / 'credential.json')
+    exit(main(Path(__file__).parent / 'credential.json'))
