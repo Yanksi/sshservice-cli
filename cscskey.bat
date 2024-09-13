@@ -1,1 +1,1 @@
-C:\Users\shuhli\AppData\Local\miniforge3\envs\cscs\python.exe C:\Users\shuhli\AppData\Local\sshservice-cli\cscs-keygen.py
+C:\Users\yanks\mambaforge\envs\Thesis\python.exe C:\Users\yanks\Documents\ETH\Thesis\sshservice-cli\cscs-keygen.py
