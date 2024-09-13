@@ -30,7 +30,6 @@ from pathlib import Path
 #Variables:
 api_get_keys = 'https://sshservice.cscs.ch/api/v1/auth/ssh-keys/signed-key'
 ssh_folder = Path(os.path.expanduser("~")) / '.ssh'
-time_stamp = int(time.time())
 priv_key_name = 'cscs-key'
 
 #Methods:
@@ -112,19 +111,22 @@ def set_passphrase():
         print("Please set the same passphrase twice...")
     return passphrase
 
-def key_valid(priv_key_f):
+def key_invalid_after(priv_key_f):
+    curr_time = int(time.time())
     if not priv_key_f.exists():
-        return False
+        return 0
     modified_time = int(os.path.getmtime(priv_key_f))
-    return (time_stamp - modified_time) < 86400 # 1 day
+    return max(86400 - (curr_time - modified_time), 0) # number of seconds left for the key to expire
 
 def main(credentials_file=None):
-    if key_valid(ssh_folder / priv_key_name):
-        print("Keys are still valid.")
-        return
-    user, pwd, otp = get_user_credentials(credentials_file)
-    public, private = get_keys(user, pwd, otp)
-    save_keys(public, private)
+    while True:
+        time_left = key_invalid_after(ssh_folder / priv_key_name)
+        if time_left > 0:
+            print("The key is still valid for " + str(time_left) + " seconds.")
+            time.sleep(time_left + 10) # sleep for 10 seconds more than the time left
+        user, pwd, otp = get_user_credentials(credentials_file)
+        public, private = get_keys(user, pwd, otp)
+        save_keys(public, private)
 #     message = """        
 
 # Usage:
