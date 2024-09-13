@@ -144,4 +144,4 @@ def main(credentials_file=None):
 #     print(message)
 
 if __name__ == "__main__":
-    main(Path(__file__).parent / 'credential.json')
+    exit(main(Path(__file__).parent / 'credential.json'))
