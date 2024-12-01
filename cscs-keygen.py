@@ -103,12 +103,12 @@ def set_passphrase():
     no_choices = ['no', 'n']
 
     if user_input.lower() in no_choices:
-      passphrase = False
+        passphrase = False
     else:
-      passphrase = True
-      cmd = 'ssh-keygen -f ~/.ssh/cscs-key -p'
-      while (os.system(cmd) != 0):
-        print("Please set the same passphrase twice...")
+        passphrase = True
+        cmd = 'ssh-keygen -f ~/.ssh/cscs-key -p'
+        while (os.system(cmd) != 0):
+            print("Please set the same passphrase twice...")
     return passphrase
 
 def key_invalid_after(priv_key_f):
@@ -119,6 +119,18 @@ def key_invalid_after(priv_key_f):
     return max(86400 - (curr_time - modified_time), 0) # number of seconds left for the key to expire
 
 def main(credentials_file=None):
+    credential_folder = Path(__file__).parent
+    # check if a file called pid exists in the same folder as the script
+    # if it does, then the script is already running
+    pid_file = credential_folder / 'pid'
+    if pid_file.exists():
+        # kill the previous process
+        with open(pid_file, 'r') as f:
+            pid = f.read()
+            os.kill(int(pid), 9)
+    # write the current process id to the pid file
+    with open(pid_file, 'w') as f:
+        f.write(str(os.getpid()))
     while True:
         time_left = key_invalid_after(ssh_folder / priv_key_name)
         if time_left > 0:
