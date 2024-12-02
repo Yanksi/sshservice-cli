@@ -25,6 +25,7 @@ import time
 import json
 import pyotp
 from pathlib import Path
+import psutil
 # from progress.bar import IncrementalBar
 
 #Variables:
@@ -126,8 +127,11 @@ def main(credentials_file=None):
     if pid_file.exists():
         # kill the previous process
         with open(pid_file, 'r') as f:
-            pid = f.read()
-            os.kill(int(pid), 9)
+            pid = int(f.read())
+            ps = psutil.Process(pid)
+            # check if the process is actually a python process
+            if "python" in ps.name():
+                ps.terminate()
     # write the current process id to the pid file
     with open(pid_file, 'w') as f:
         f.write(str(os.getpid()))
