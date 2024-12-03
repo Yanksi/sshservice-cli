@@ -128,12 +128,13 @@ def main(credentials_file=None):
         # kill the previous process
         with open(pid_file, 'r') as f:
             pid = int(f.read())
-            ps = psutil.Process(pid)
-            # check if the process is actually a the previous process
-            cmdline = ps.cmdline()
-            if len(cmdline) == 2 and 'python' in cmdline[0] and 'cscs-keygen.py' in cmdline[1]:
-                print("The script is already running. Terminating the previous process...")
-                ps.terminate()
+            if psutil.pid_exists(pid):
+                ps = psutil.Process(pid)
+                # check if the process is actually a the previous process
+                cmdline = ps.cmdline()
+                if len(cmdline) == 2 and 'python' in cmdline[0] and 'cscs-keygen.py' in cmdline[1]:
+                    print("The script is already running. Terminating the previous process...")
+                    ps.terminate()
                 
     # write the current process id to the pid file
     with open(pid_file, 'w') as f:
