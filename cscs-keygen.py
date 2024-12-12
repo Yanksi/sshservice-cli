@@ -26,6 +26,7 @@ import json
 import pyotp
 from pathlib import Path
 import psutil
+import argparse
 # from progress.bar import IncrementalBar
 
 #Variables:
@@ -119,34 +120,41 @@ def key_invalid_after(priv_key_f):
     modified_time = int(os.path.getmtime(priv_key_f))
     return max(86400 - (curr_time - modified_time), 0) # number of seconds left for the key to expire
 
-def main(credentials_file=None):
+def main(credentials_file=None, once=False, force=False):
     credential_folder = Path(__file__).parent
     # check if a file called pid exists in the same folder as the script
     # if it does, then the script is already running
-    pid_file = credential_folder / 'pid'
-    if pid_file.exists():
-        # kill the previous process
-        with open(pid_file, 'r') as f:
-            pid = int(f.read())
-            if psutil.pid_exists(pid):
-                ps = psutil.Process(pid)
-                # check if the process is actually a the previous process
-                cmdline = ps.cmdline()
-                if len(cmdline) == 2 and 'python' in cmdline[0] and 'cscs-keygen.py' in cmdline[1]:
-                    print("The script is already running. Terminating the previous process...")
-                    ps.terminate()
-                
-    # write the current process id to the pid file
-    with open(pid_file, 'w') as f:
-        f.write(str(os.getpid()))
+    if not once: # if the script is running only once, then there is no need to check for other instances
+        pid_file = credential_folder / 'pid'
+        if pid_file.exists():
+            # kill the previous process
+            with open(pid_file, 'r') as f:
+                pid = int(f.read())
+                if psutil.pid_exists(pid):
+                    ps = psutil.Process(pid)
+                    # check if the process is actually a the previous process
+                    cmdline = ps.cmdline()
+                    if len(cmdline) == 2 and 'python' in cmdline[0] and 'cscs-keygen.py' in cmdline[1]:
+                        print("The script is already running. Terminating the previous process...")
+                        ps.terminate()
+                    
+        # write the current process id to the pid file
+        with open(pid_file, 'w') as f:
+            f.write(str(os.getpid()))
+
     while True:
         time_left = key_invalid_after(ssh_folder / priv_key_name)
-        if time_left > 0:
+        if time_left > 0 and not force:
             print("The key is still valid for " + str(time_left) + " seconds.")
+            if once:
+                break
             time.sleep(time_left + 10) # sleep for 10 seconds more than the time left
         user, pwd, otp = get_user_credentials(credentials_file)
         public, private = get_keys(user, pwd, otp)
         save_keys(public, private)
+        if force:
+            break
+
 #     message = """        
 
 # Usage:
@@ -164,4 +172,9 @@ def main(credentials_file=None):
 #     print(message)
 
 if __name__ == "__main__":
-    exit(main(Path(__file__).parent / 'credential.json'))
+    parser = argparse.ArgumentParser(description='Generate CSCS keys')
+    parser.add_argument('--once', action='store_true', help='Run the script only once')
+    parser.add_argument('--force', action='store_true', help='Force the script to run even if the key is still valid')
+    parser.add_argument('--credentials', type=str, help='Path to the credentials file', default=Path(__file__).parent / 'credential.json')
+    args = parser.parse_args()
+    exit(main(args.credentials, args.once, args.force))

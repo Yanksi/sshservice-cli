@@ -1,2 +1,4 @@
 progress==1.6
 requests==2.25.1
+psutil
+pyotp
