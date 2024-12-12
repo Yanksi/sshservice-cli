@@ -2,9 +2,10 @@ $scriptPath = $PSScriptRoot
 $scriptFilePy = Join-Path -Path $scriptPath -ChildPath "cscs-keygen.py"
 
 $timeleft = & C:\Users\yanks\mambaforge\envs\Thesis\python.exe $scriptFilePy --once
-if ($timeleft -match '\d+') {
-    $timeleft = [int]$matches[0]
-}
+
+$timeMatches = [regex]::matches($timeleft, '\d+')
+$timeleft = [int]$timeMatches[0].Value
+
 $timeleft = $timeleft + 10 # delay by 10 seconds
 
 $scriptFile = Join-Path -Path $scriptPath -ChildPath "autotask.ps1"
