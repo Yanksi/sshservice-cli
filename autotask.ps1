@@ -7,7 +7,6 @@ if ($timeleft -match '\d+') {
 }
 $timeleft = $timeleft + 10 # delay by 10 seconds
 
-
 $scriptFile = Join-Path -Path $scriptPath -ChildPath "autotask.ps1"
 
 $task_path = "\Utils\"
@@ -28,8 +27,11 @@ if ($task_exists) {
     $trigger.StartBoundary = (Get-Date).AddSeconds($timeleft).ToString("yyyy-MM-ddTHH:mm:ss")
     Set-ScheduledTask -TaskPath $task_path -TaskName $task_name -Trigger $trigger
 } else {
-    $STAct = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File '$scriptFile'"
+    $STAct = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "$scriptFile"
     $STrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds($timeleft).ToString("yyyy-MM-ddTHH:mm:ss")
     $STSet = $STSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -RunOnlyIfNetworkAvailable -StartWhenAvailable
     Register-ScheduledTask -TaskName $task_name -Action $STAct -Trigger $STrigger -TaskPath $task_path -Settings $STSet
 }
+
+# # press any key to exit
+# $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
