@@ -1,7 +1,7 @@
 $scriptPath = $PSScriptRoot
 $scriptFilePy = Join-Path -Path $scriptPath -ChildPath "cscs-keygen.py"
 
-$timeleft = & C:\Users\yanks\mambaforge\envs\Thesis\python.exe $scriptFilePy --once
+$timeleft = & uv run $scriptFilePy --once
 
 $timeMatches = [regex]::matches($timeleft, '\d+')
 $timeleft = [int]$timeMatches[0].Value

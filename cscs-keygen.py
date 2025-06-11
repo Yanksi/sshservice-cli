@@ -1,3 +1,13 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "progress==1.6",
+#     "psutil",
+#     "pyotp",
+#     "requests==2.25.1",
+# ]
+# ///
+
 # This script sets the environment properly so that a user can access CSCS
 # login nodes via ssh. 
 
@@ -178,3 +188,4 @@ if __name__ == "__main__":
     parser.add_argument('--credentials', type=str, help='Path to the credentials file', default=Path(__file__).parent / 'credential.json')
     args = parser.parse_args()
     exit(main(args.credentials, args.once, args.force))
+
