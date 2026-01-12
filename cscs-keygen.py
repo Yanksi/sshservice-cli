@@ -5,6 +5,7 @@
 #     "psutil",
 #     "pyotp",
 #     "requests==2.25.1",
+#     "keyring",
 # ]
 # ///
 
@@ -37,10 +38,12 @@ import pyotp
 from pathlib import Path
 import psutil
 import argparse
+import keyring
 # from progress.bar import IncrementalBar
 
 #Variables:
 api_get_keys = 'https://sshservice.cscs.ch/api/v1/auth/ssh-keys/signed-key'
+service_id = 'cscs-keygen'
 ssh_folder = Path(os.path.expanduser("~")) / '.ssh'
 priv_key_name = 'cscs-key'
 
@@ -49,13 +52,69 @@ def get_user_credentials(fname=None):
     credentials = {}
     if fname is not None and fname.exists():
         print("Reading credentials from file: " + str(fname))
-        with open(fname, 'r') as f:
-            credentials = json.load(f)
-            if 'otp_secret' in credentials:
-                credentials['otp'] = pyotp.TOTP(credentials['otp_secret']).now()
-    user = input("Username: ") if 'username' not in credentials else credentials['username']
-    pwd = getpass.getpass() if 'password' not in credentials else credentials['password']
-    otp = getpass.getpass("Enter OTP (6-digit code):") if 'otp' not in credentials else credentials['otp']
+        try:
+            with open(fname, 'r') as f:
+                credentials = json.load(f)
+        except Exception:
+            pass
+
+    user = credentials.get('username')
+    if not user:
+        user = input("Username: ")
+        # Save username to file
+        if fname:
+            try:
+                with open(fname, 'w') as f:
+                    json.dump({'username': user}, f, indent=4)
+            except Exception as e:
+                print(f"Warning: Could not save username: {e}")
+
+    pwd = keyring.get_password(service_id, user)
+    if not pwd:
+        if 'password' in credentials:
+            pwd = credentials['password']
+            keyring.set_password(service_id, user, pwd)
+            print("Migrated password to keyring.")
+        else:
+            pwd = getpass.getpass()
+            keyring.set_password(service_id, user, pwd)
+
+    otp_secret = keyring.get_password(service_id + "_otp", user)
+    otp = None
+    
+    if otp_secret:
+        otp = pyotp.TOTP(otp_secret).now()
+    else:
+        if 'otp_secret' in credentials:
+            otp_secret = credentials['otp_secret']
+            keyring.set_password(service_id + "_otp", user, otp_secret)
+            otp = pyotp.TOTP(otp_secret).now()
+            print("Migrated OTP secret to keyring.")
+        else:
+            while not otp:
+                inp = getpass.getpass("Enter OTP (6-digit code) or OTP Secret to store:")
+                clean_inp = inp.strip()
+                if len(clean_inp) == 6 and clean_inp.isdigit():
+                    otp = clean_inp
+                elif clean_inp:
+                    try:
+                        otp = pyotp.TOTP(clean_inp).now()
+                        keyring.set_password(service_id + "_otp", user, clean_inp)
+                        print("OTP Secret stored in keyring.")
+                    except:
+                        print("Invalid input. Please enter a valid 6-digit OTP code or a valid OTP Secret.")
+                else:
+                    print("Input cannot be empty.")
+
+    # Clean up secrets from file if they existed
+    if fname and fname.exists() and ('password' in credentials or 'otp_secret' in credentials):
+        print("Cleaning up secrets from file...")
+        try:
+            with open(fname, 'w') as f:
+                json.dump({'username': user}, f, indent=4)
+        except Exception as e:
+            print(f"Warning: Could not clean up file: {e}")
+
     return user, pwd, otp
 
 def get_keys(username, password, otp):
@@ -107,21 +166,6 @@ def save_keys(public,private):
         os.chmod(os.path.expanduser("~")+'/.ssh/cscs-key', 0o600)
     except Exception as ex:
         sys.exit('Error: cannot change permissions of the private key.', ex)
-
-def set_passphrase():
-    user_input = input('Do you want to add a passphrase to your key? [y/n] (Default y) \n')
-
-    yes_choices = ['yes', 'y']
-    no_choices = ['no', 'n']
-
-    if user_input.lower() in no_choices:
-        passphrase = False
-    else:
-        passphrase = True
-        cmd = 'ssh-keygen -f ~/.ssh/cscs-key -p'
-        while (os.system(cmd) != 0):
-            print("Please set the same passphrase twice...")
-    return passphrase
 
 def key_invalid_after(priv_key_f):
     curr_time = int(time.time())
