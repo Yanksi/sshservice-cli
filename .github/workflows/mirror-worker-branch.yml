@@ -1,0 +1,50 @@
+name: Mirror worker/ to worker branch
+
+# Cloudflare's Deploy-to-Workers button works most reliably when wrangler.toml
+# sits at the repository root. We keep authoritative sources under worker/ on
+# main, and this workflow republishes the contents of that directory as the
+# tip of the `worker` branch on every push that touches it.
+#
+# The deploy-button URL therefore points at:
+#   https://github.com/<user>/<repo>/tree/worker
+# rather than:
+#   https://github.com/<user>/<repo>/tree/main/worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/**'
+      - '.github/workflows/mirror-worker-branch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Republish worker/ as `worker` branch
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/worker"
+          STAGE="$RUNNER_TEMP/worker-branch"
+
+          mkdir -p "$STAGE"
+          # Mirror worker/ into a clean staging dir (preserves dotfiles).
+          rsync -a --delete --exclude='.git' "$SRC"/ "$STAGE"/
+
+          cd "$STAGE"
+          git init -q -b worker
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "sync from main @ ${GITHUB_SHA::7}"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -f origin worker

@@ -39,7 +39,11 @@ multi-user file format.
 
 Deploy the Worker once, then point every device's `credential.json` at it.
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Yanksi/sshservice-cli/tree/main/worker)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Yanksi/sshservice-cli/tree/worker)
+
+> The deploy URL targets the `worker` branch, which is auto-mirrored from
+> `worker/` on `main` by [.github/workflows/mirror-worker-branch.yml](.github/workflows/mirror-worker-branch.yml).
+> This avoids a Cloudflare deploy-UI edge case with subdirectory paths.
 
 The Cloudflare UI will fork the repo, provision the KV namespace, and prompt
 you for these secrets:
