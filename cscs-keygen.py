@@ -44,16 +44,19 @@ import keyring
 #Variables:
 api_get_keys = 'https://sshservice.cscs.ch/api/v1/auth/ssh-keys/signed-key'
 service_id = 'cscs-keygen'
+proxy_service_id = 'cscs-keygen_proxy'
 ssh_folder = Path(os.path.expanduser("~")) / '.ssh'
 priv_key_name = 'cscs-key'
+proxy_token_fallback = Path(os.path.expanduser("~")) / '.config' / 'cscs-keygen' / 'proxy_token'
 
 #Methods:
-def load_users(fname):
-    """Load the credentials file. Returns (users, legacy).
+def load_config(fname):
+    """Load the credentials file. Returns (mode, proxy, users, legacy).
 
-    Supports two file shapes:
+    Supports three file shapes:
       - legacy single-user:  {"username": "...", "password": "...", "otp_secret": "..."}
-      - multi-user:          {"users": [{"username": "...", ...}, ...]}
+      - multi-user direct:   {"users": [{"username": "...", ...}, ...]}
+      - proxy fetcher:       {"mode": "proxy", "proxy": {"url": "...", "token": "..."}}
     """
     data = {}
     if fname is not None and fname.exists():
@@ -64,34 +67,47 @@ def load_users(fname):
         except Exception:
             pass
 
+    mode = data.get('mode', 'direct') if isinstance(data, dict) else 'direct'
+    proxy = data.get('proxy') if isinstance(data, dict) else None
+    if not isinstance(proxy, dict):
+        proxy = {}
+
     if isinstance(data, dict) and isinstance(data.get('users'), list):
-        return list(data['users']), False
+        users, legacy = list(data['users']), False
+    else:
+        # Legacy / empty file: treat as a single-user entry
+        legacy_entry = {
+            k: v for k, v in (data.items() if isinstance(data, dict) else [])
+            if k in ('username', 'password', 'otp_secret', 'key_name')
+        }
+        users, legacy = [legacy_entry], True
 
-    # Legacy / empty file: treat as a single-user entry
-    legacy_entry = {
-        k: v for k, v in data.items()
-        if k in ('username', 'password', 'otp_secret', 'key_name')
-    }
-    return [legacy_entry], True
+    return mode, proxy, users, legacy
 
-def save_users_file(fname, users, legacy):
-    """Persist usernames (and any explicit key_name overrides) back to disk.
-    Secrets are never written back — they live only in the keyring."""
+def save_config_file(fname, mode, proxy, users, legacy):
+    """Persist non-secret config back to disk. Secrets live only in the keyring
+    (or the chmod-600 fallback file when keyring is unavailable)."""
     if not fname:
         return
-    cleaned = []
+    cleaned_users = []
     for u in users:
         if not u.get('username'):
             continue
         entry = {'username': u['username']}
         if 'key_name' in u:
             entry['key_name'] = u['key_name']
-        cleaned.append(entry)
+        cleaned_users.append(entry)
 
-    if legacy and len(cleaned) == 1:
-        out = cleaned[0]
+    if mode == 'proxy':
+        out = {'mode': 'proxy'}
+        if proxy.get('url'):
+            out['proxy'] = {'url': proxy['url']}
+            if proxy.get('key_name'):
+                out['proxy']['key_name'] = proxy['key_name']
+    elif legacy and len(cleaned_users) == 1:
+        out = cleaned_users[0]
     else:
-        out = {'users': cleaned}
+        out = {'users': cleaned_users}
 
     try:
         with open(fname, 'w') as f:
@@ -157,6 +173,92 @@ def get_user_credentials(user_entry):
                     print("Input cannot be empty.")
 
     return user, pwd, otp, had_file_secret
+
+def _keyring_set(service, account, secret):
+    """Try to store in OS keyring; return True on success, False if backend unavailable."""
+    try:
+        keyring.set_password(service, account, secret)
+        return True
+    except Exception as e:
+        print(f"Keyring unavailable ({e}); falling back to {proxy_token_fallback}.")
+        return False
+
+def _keyring_get(service, account):
+    """Try to read from OS keyring; return None on missing entry or backend failure."""
+    try:
+        return keyring.get_password(service, account)
+    except Exception:
+        return None
+
+def _file_token_read():
+    if not proxy_token_fallback.exists():
+        return None
+    try:
+        return proxy_token_fallback.read_text().strip() or None
+    except Exception:
+        return None
+
+def _file_token_write(token):
+    proxy_token_fallback.parent.mkdir(parents=True, exist_ok=True)
+    proxy_token_fallback.write_text(token)
+    try:
+        os.chmod(proxy_token_fallback, 0o600)
+    except Exception:
+        pass
+
+def get_proxy_token(proxy):
+    """Resolve the proxy fetch token. Prefers keyring; falls back to a chmod-600
+    file at ~/.config/cscs-keygen/proxy_token. On first run, migrates a token
+    found in the config file into whichever store is available, then signals
+    the caller to strip it from the config."""
+    url = proxy.get('url')
+    if not url:
+        sys.exit("Error: proxy mode requires `proxy.url` in the credentials file.")
+
+    account = url  # one token per proxy URL
+
+    token = _keyring_get(proxy_service_id, account)
+    if token:
+        return token, False
+
+    token = _file_token_read()
+    if token:
+        return token, False
+
+    # Migration path: token still sitting in the config file from initial setup.
+    if proxy.get('token'):
+        token = proxy.pop('token')
+        if _keyring_set(proxy_service_id, account, token):
+            print("Migrated proxy token to keyring.")
+        else:
+            _file_token_write(token)
+            print(f"Stored proxy token at {proxy_token_fallback} (chmod 600).")
+        return token, True
+
+    # Last resort: prompt.
+    token = getpass.getpass("Proxy fetch token: ").strip()
+    if not token:
+        sys.exit("Error: proxy token is required.")
+    if _keyring_set(proxy_service_id, account, token):
+        print("Stored proxy token in keyring.")
+    else:
+        _file_token_write(token)
+        print(f"Stored proxy token at {proxy_token_fallback} (chmod 600).")
+    return token, False
+
+def fetch_keys_from_proxy(proxy_url, token):
+    """GET /cert from the proxy worker. Returns (public_cert, private_key)."""
+    url = proxy_url.rstrip('/') + '/cert'
+    print(f"Fetching keys from proxy {url}")
+    try:
+        resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, timeout=15)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"Error: proxy fetch failed: {e}")
+    body = resp.json()
+    if not body.get('cert') or not body.get('key'):
+        sys.exit("Error: proxy returned no cert/key (worker may not have populated yet — try POST /refresh).")
+    return body['cert'], body['key']
 
 def get_keys(username, password, otp):
     print(f"[{username}] Fetching keys from CSCS...")
@@ -239,7 +341,33 @@ def main(credentials_file=None, once=False, force=False):
         with open(pid_file, 'w') as f:
             f.write(str(os.getpid()))
 
-    users, legacy = load_users(credentials_file)
+    mode, proxy, users, legacy = load_config(credentials_file)
+
+    if mode == 'proxy':
+        key_name = proxy.get('key_name') or priv_key_name
+        while True:
+            time_left = key_invalid_after(ssh_folder / key_name)
+            if time_left > 0 and not force:
+                print(f"The key is still valid for {time_left} seconds.")
+                if once:
+                    break
+                time.sleep(time_left + 10)
+                continue
+
+            token, migrated = get_proxy_token(proxy)
+            public, private = fetch_keys_from_proxy(proxy['url'], token)
+            save_keys(public, private, key_name)
+            print(f"Keys saved to {ssh_folder / key_name}")
+
+            if migrated:
+                print("Cleaning up token from file...")
+                save_config_file(credentials_file, mode, proxy, users, legacy)
+
+            if once or force:
+                break
+        return
+
+    # mode == 'direct'
     if not users:
         users = [{}]
 
@@ -250,7 +378,7 @@ def main(credentials_file=None, once=False, force=False):
             user_entry['username'] = input("Username: ").strip()
             file_dirty = True
     if file_dirty:
-        save_users_file(credentials_file, users, legacy)
+        save_config_file(credentials_file, mode, proxy, users, legacy)
 
     while True:
         min_time_left = min(
@@ -277,7 +405,7 @@ def main(credentials_file=None, once=False, force=False):
 
         if had_any_file_secret:
             print("Cleaning up secrets from file...")
-            save_users_file(credentials_file, users, legacy)
+            save_config_file(credentials_file, mode, proxy, users, legacy)
 
         if force:
             break

@@ -1,2 +1,7 @@
 credential.json
 pid
+__pycache__/
+worker/node_modules
+worker/.wrangler
+worker/.dev.vars
+worker/dist
