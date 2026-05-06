@@ -3,11 +3,13 @@ main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
 # KV namespace holds the latest generated key + cert as a single JSON blob.
-# Wrangler auto-provisions this on first `deploy` when `id` is omitted, and
-# writes the generated id back into this file. The Deploy-to-Cloudflare button
-# uses the same path.
+# The id below is a syntactically valid placeholder. The Deploy-to-Cloudflare
+# button provisions a real namespace at deploy time and rewrites this id; for
+# manual `wrangler deploy`, replace it with the value printed by
+# `npx wrangler kv namespace create CERT_STORE`.
 [[kv_namespaces]]
 binding = "CERT_STORE"
+id = "00000000000000000000000000000000"
 
 # Cron: refresh twice a day. CSCS certs are valid for 24h.
 [triggers]
