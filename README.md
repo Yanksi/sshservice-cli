@@ -33,7 +33,9 @@ bash cscs-keygen.sh
 
 The first run prompts for username/password/OTP and stores the secrets in your
 OS keyring. See [credential_sample.json](credential_sample.json) for the
-multi-user file format.
+multi-user file format (direct mode); see
+[credential_sample_proxy.json](credential_sample_proxy.json) for the proxy-mode
+shape.
 
 ## Proxy mode
 
