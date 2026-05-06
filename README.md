@@ -43,28 +43,13 @@ Deploy the Worker once, then point every device's `credential.json` at it.
 
 > The deploy URL targets the `worker` branch, which is auto-mirrored from
 > `worker/` on `main` by [.github/workflows/mirror-worker-branch.yml](.github/workflows/mirror-worker-branch.yml).
-> This avoids a Cloudflare deploy-UI edge case with subdirectory paths.
 
-The Cloudflare UI will fork the repo, provision the KV namespace, and prompt
-you for these secrets:
+**Read [worker/README.md](worker/README.md) before clicking** — it covers the
+security tradeoff (the Worker holds your password + TOTP seed), the
+post-deploy steps the button does *not* cover (you set the four secrets
+manually in the dashboard), the HTTP API, and rotation procedures.
 
-| Secret              | What it is                                                       |
-|---------------------|------------------------------------------------------------------|
-| `CSCS_USERNAME`     | Your CSCS username                                               |
-| `CSCS_PASSWORD`     | Your CSCS password                                               |
-| `CSCS_OTP_SECRET`   | Your TOTP **seed** (base32), not a 6-digit code                  |
-| `FETCH_TOKEN`       | Bearer token clients use to fetch — e.g. `openssl rand -hex 32`  |
-
-After deploy, kick off the first refresh so KV is populated before the first
-cron tick:
-
-```sh
-curl -X POST -H "Authorization: Bearer $FETCH_TOKEN" \
-  https://cscs-key-proxy.<your-subdomain>.workers.dev/refresh
-```
-
-Then on every device that should fetch from the proxy, replace
-`credential.json` with:
+Once the Worker is live, point each device at it via `credential.json`:
 
 ```json
 {
@@ -76,7 +61,7 @@ Then on every device that should fetch from the proxy, replace
 }
 ```
 
-Run once:
+Then run:
 
 ```sh
 python cscs-keygen.py --once
@@ -84,19 +69,14 @@ python cscs-keygen.py --once
 
 The token is moved to the OS keyring (`cscs-keygen_proxy` service) on the
 first run and stripped from the file. On clusters without a keyring backend
-(e.g. headless CSCS login nodes), the token falls back to a
-`chmod 600` file at `~/.config/cscs-keygen/proxy_token`.
+(e.g. headless CSCS login nodes), it falls back to a `chmod 600` file at
+`~/.config/cscs-keygen/proxy_token`.
 
-For a `.bashrc` snippet that runs the fetch only when the local cert is about
-to expire:
+For a `.bashrc` snippet that refreshes the cert in the background only when
+it's about to expire:
 
 ```bash
-# refresh the CSCS cert if it expires within the next hour
 if [ -x "$HOME/sshservice-cli/cscs-keygen.py" ]; then
     python "$HOME/sshservice-cli/cscs-keygen.py" --once >/dev/null 2>&1 &
 fi
 ```
-
-See [worker/README.md](worker/README.md) for the **security tradeoff** (the
-Worker holds your password + TOTP seed), the HTTP API, and manual deploy
-instructions.

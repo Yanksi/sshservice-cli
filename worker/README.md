@@ -28,8 +28,8 @@ anyone with write access to the Worker code.
 
 - **One Worker** with two HTTP endpoints and a cron trigger.
 - **One KV namespace** holding the latest `{ key, cert, generated_at }` JSON.
-- **Four Worker secrets**: `CSCS_USERNAME`, `CSCS_PASSWORD`, `CSCS_OTP_SECRET`,
-  `FETCH_TOKEN`.
+- **Four Worker secrets** that you set after deploy: `CSCS_USERNAME`,
+  `CSCS_PASSWORD`, `CSCS_OTP_SECRET`, `FETCH_TOKEN`.
 
 The cron fires every 12h (`0 */12 * * *`). CSCS certs are valid for 24h.
 
@@ -55,18 +55,83 @@ All non-`/` routes require `Authorization: Bearer <FETCH_TOKEN>`.
 
 ## Deploy via the button (recommended)
 
-Click **Deploy to Cloudflare Workers** in the top-level [README](../README.md).
+The button is in the top-level [README](../README.md). It targets the
+auto-generated `worker` branch, which is a flat-layout mirror of this
+directory (see [.github/workflows/mirror-worker-branch.yml](../.github/workflows/mirror-worker-branch.yml))
+because Cloudflare's deploy UI works most reliably with `wrangler.toml` at
+the repository root.
+
+The walkthrough below is one-time setup; afterwards every push to `main`
+that touches `worker/` redeploys automatically through Cloudflare Workers
+Builds.
+
+### 1. Click the button
+
 The Cloudflare UI will:
 
-1. Fork the repo into your account.
-2. Provision the KV namespace defined in `wrangler.toml`.
-3. Prompt you for the four secrets above.
-4. Deploy the Worker and start the cron.
+- Authenticate you with Cloudflare (and prompt to install the Cloudflare
+  GitHub App if it isn't already).
+- Fork the repo into your account.
+- Provision the KV namespace declared in `wrangler.toml`. The placeholder
+  `id = "0000…"` value is rewritten with the real id during deploy.
+- Build and deploy the Worker, register the cron.
 
-You can then `POST /refresh` once to populate the KV before the first cron
-fires.
+### 2. Set the secrets manually
 
-## Deploy manually
+The button **does not prompt for secrets** — it only ever prompts for
+plaintext `[vars]` declared in `wrangler.toml`, which secrets are not. Set
+them in the dashboard right after deploy:
+
+1. **Cloudflare dashboard** → **Workers & Pages** → click your Worker.
+2. **Settings** → **Variables and Secrets** → **Add variable**.
+3. For each row below, set the **Type** to **Secret** and click Save:
+
+   | Name                | Value                                                                |
+   |---------------------|----------------------------------------------------------------------|
+   | `CSCS_USERNAME`     | Your CSCS username                                                   |
+   | `CSCS_PASSWORD`     | Your CSCS password                                                   |
+   | `CSCS_OTP_SECRET`   | Your TOTP **seed** (base32). Not a 6-digit code.                     |
+   | `FETCH_TOKEN`       | A random bearer token; e.g. `openssl rand -hex 32`. Save a copy — clients need it. |
+
+Until all four are present, the cron will error on every tick with a
+clear log line in the Worker's "Logs" tab.
+
+### 3. Trigger the first refresh
+
+The next cron is up to 12 hours away, so kick off a refresh manually so
+clients have something to fetch immediately:
+
+```bash
+curl -X POST -H "Authorization: Bearer <FETCH_TOKEN>" \
+  https://cscs-key-proxy.<your-subdomain>.workers.dev/refresh
+```
+
+A `200` with `{ "key": "...", "cert": "...", "generated_at": ... }` means
+the whole pipeline (CSCS auth, TOTP generation, KV write) is healthy.
+Anything else: open the Worker's Logs tab in the dashboard and read the
+error.
+
+### 4. Point clients at the Worker
+
+In each device's `credential.json`:
+
+```json
+{
+  "mode": "proxy",
+  "proxy": {
+    "url": "https://cscs-key-proxy.<your-subdomain>.workers.dev",
+    "token": "<FETCH_TOKEN>"
+  }
+}
+```
+
+The token is moved into the OS keyring (or
+`~/.config/cscs-keygen/proxy_token` chmod-600 fallback) on the first
+`python cscs-keygen.py --once` and stripped from the file.
+
+## Deploy manually (no button)
+
+If you'd rather skip the button and run wrangler yourself:
 
 ```bash
 cd worker
@@ -75,22 +140,18 @@ npx wrangler kv namespace create CERT_STORE     # paste the printed id into wran
 npx wrangler secret put CSCS_USERNAME
 npx wrangler secret put CSCS_PASSWORD
 npx wrangler secret put CSCS_OTP_SECRET         # base32 seed, NOT a 6-digit code
-npx wrangler secret put FETCH_TOKEN             # generate one, e.g. `openssl rand -hex 32`
+npx wrangler secret put FETCH_TOKEN             # e.g. `openssl rand -hex 32`
 npx wrangler deploy
 ```
 
-Then trigger the first refresh:
+Then trigger the first refresh as in step 3 above.
 
-```bash
-curl -X POST -H "Authorization: Bearer $FETCH_TOKEN" \
-  https://cscs-key-proxy.<your-subdomain>.workers.dev/refresh
-```
+## Rotating secrets
 
-## Rotating tokens
+`FETCH_TOKEN` rotation: dashboard (or `wrangler secret put FETCH_TOKEN`),
+then update each client's keyring entry (or
+`~/.config/cscs-keygen/proxy_token` fallback).
 
-`FETCH_TOKEN` rotation: `wrangler secret put FETCH_TOKEN`, then update each
-client's keyring entry (or `~/.config/cscs-keygen/proxy_token` fallback).
-
-CSCS password / TOTP rotation: re-run `wrangler secret put CSCS_PASSWORD` /
-`CSCS_OTP_SECRET`. The next cron tick (or a `POST /refresh`) picks up the new
-values.
+CSCS password / TOTP rotation: re-run `wrangler secret put CSCS_PASSWORD`
+/ `CSCS_OTP_SECRET`. The next cron tick (or a `POST /refresh`) picks up
+the new values.
