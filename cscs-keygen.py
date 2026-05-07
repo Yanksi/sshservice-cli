@@ -247,7 +247,11 @@ def get_proxy_token(proxy):
     return token, False
 
 def fetch_keys_from_proxy(proxy_url, token):
-    """GET /cert from the proxy worker. Returns (public_cert, private_key)."""
+    """GET /cert from the proxy worker. Returns (public_cert, private_key, generated_at_ms).
+
+    generated_at_ms is when the worker fetched the cert from CSCS, used to anchor
+    local mtime to the CSCS-side creation time instead of this fetch time. None
+    if absent (older worker or unexpected payload)."""
     url = proxy_url.rstrip('/') + '/cert'
     print(f"Fetching keys from proxy {url}")
     try:
@@ -258,7 +262,10 @@ def fetch_keys_from_proxy(proxy_url, token):
     body = resp.json()
     if not body.get('cert') or not body.get('key'):
         sys.exit("Error: proxy returned no cert/key (worker may not have populated yet — try POST /refresh).")
-    return body['cert'], body['key']
+    generated_at = body.get('generated_at')
+    if not isinstance(generated_at, (int, float)):
+        generated_at = None
+    return body['cert'], body['key'], generated_at
 
 def get_keys(username, password, otp):
     print(f"[{username}] Fetching keys from CSCS...")
@@ -288,7 +295,7 @@ def get_keys(username, password, otp):
             sys.exit("Error: Unable to fetch private key.")
         return public_key, private_key
 
-def save_keys(public, private, key_name):
+def save_keys(public, private, key_name, generated_at_ms=None):
     if not public or not private:
         sys.exit("Error: invalid keys.")
     priv_path = ssh_folder / key_name
@@ -311,6 +318,15 @@ def save_keys(public, private, key_name):
         os.chmod(priv_path, 0o600)
     except Exception as ex:
         sys.exit(f'Error: cannot change permissions of the private key: {ex}')
+    # Anchor mtime to the CSCS-side creation time so key_invalid_after()
+    # measures against when the cert was signed, not when we fetched it.
+    if generated_at_ms is not None:
+        ts = generated_at_ms / 1000.0
+        try:
+            os.utime(pub_path, (ts, ts))
+            os.utime(priv_path, (ts, ts))
+        except Exception as ex:
+            print(f"Warning: could not set mtime from generated_at: {ex}")
 
 def key_invalid_after(priv_key_f):
     curr_time = int(time.time())
@@ -355,16 +371,19 @@ def main(credentials_file=None, once=False, force=False):
                 continue
 
             token, migrated = get_proxy_token(proxy)
-            public, private = fetch_keys_from_proxy(proxy['url'], token)
-            save_keys(public, private, key_name)
+            public, private, generated_at = fetch_keys_from_proxy(proxy['url'], token)
+            save_keys(public, private, key_name, generated_at)
             print(f"Keys saved to {ssh_folder / key_name}")
 
             if migrated:
                 print("Cleaning up token from file...")
                 save_config_file(credentials_file, mode, proxy, users, legacy)
 
-            if once or force:
+            if force:
                 break
+            # Loop back so the next iteration reports remaining validity
+            # (which autotask.ps1 parses to schedule its next wake-up).
+            continue
         return
 
     # mode == 'direct'

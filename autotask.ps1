@@ -1,10 +1,16 @@
 $scriptPath = $PSScriptRoot
 $scriptFilePy = Join-Path -Path $scriptPath -ChildPath "cscs-keygen.py"
 
-$timeleft = & uv run $scriptFilePy --once
+$pyOutput = & uv run $scriptFilePy --once
 
-$timeMatches = [regex]::matches($timeleft, '\d+')
-$timeleft = [int]$timeMatches[0].Value
+# Match the validity line specifically — earlier digits (chmod 600, ports in
+# URLs, digits in usernames/paths) would otherwise be picked up by a bare \d+.
+$timeMatch = [regex]::Match(($pyOutput -join "`n"), 'valid for (\d+) seconds')
+if (-not $timeMatch.Success) {
+    Write-Error "Could not parse remaining validity from cscs-keygen.py output:`n$pyOutput"
+    exit 1
+}
+$timeleft = [int]$timeMatch.Groups[1].Value
 
 $timeleft = $timeleft + 10 # delay by 10 seconds
 
