@@ -106,12 +106,30 @@ fi
 
 ## Re-registering / rotating tokens
 
-If you delete the keyring entry (`cscs-keygen_proxy` service, account
-`<username>::<endpoint>`) or the fallback file under
-`~/.config/cscs-keygen/`, the next run treats it as a fresh registration:
-prompts for password / OTP, generates a new token, calls `POST /account`
-(which overwrites the prior record on the Worker), and stores the new
-token. No re-deploy needed.
+To rotate a token (or fully reset a user's proxy state), run:
 
-To remove an account from the Worker, the device that holds the token can
-DELETE it (see [worker/README.md](worker/README.md#http-api)).
+```sh
+python cscs-keygen.py --delete-account <username>
+```
+
+This DELETEs the user's record on the Worker and clears the local token
+(keyring + fallback file). The next normal run will re-register from
+scratch — put the password / OTP seed back in `credential.json`, or let
+the script prompt for them, and a fresh token gets generated.
+
+For ad-hoc cleanup without the script (e.g. starting over on a single
+device), deleting the keyring entry (`cscs-keygen_proxy` service,
+account `<username>::<endpoint>`) or the fallback file under
+`~/.config/cscs-keygen/` is enough — the next run treats that as
+"register a new account" and overwrites the prior server-side record.
+
+If you revoked the cert in the CSCS dashboard and want a fresh one
+right away (without waiting up to 23h for the Worker's cache to expire):
+
+```sh
+python cscs-keygen.py --once --force
+```
+
+This propagates as `?force=1` to `GET /credential`, so the Worker
+ignores its cache and hits CSCS directly. The Worker rate-limits forced
+refreshes to 1/min per token to prevent loops or accidental hammering.

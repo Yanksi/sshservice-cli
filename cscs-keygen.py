@@ -288,6 +288,25 @@ def register_proxy_account(endpoint, token, username, password, otp_secret):
             err = resp.text
         sys.exit(f"Error: proxy returned HTTP {resp.status_code}: {err}")
 
+def delete_proxy_account(endpoint, token):
+    """DELETE /account on the proxy worker. Best-effort; logs but doesn't raise
+    on non-2xx server responses (the local token cleanup happens regardless)."""
+    url = endpoint.rstrip('/') + '/account'
+    print(f"Deleting account on proxy {url}")
+    try:
+        resp = requests.delete(url, headers={'Authorization': f'Bearer {token}'}, timeout=15)
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: proxy delete request failed: {e}")
+        return
+    # 204 = deleted; 401 = wrong/expired token (nothing to delete with this token anyway).
+    if resp.status_code in (200, 204, 401):
+        return
+    try:
+        err = resp.json().get('error', resp.text)
+    except Exception:
+        err = resp.text
+    print(f"Warning: proxy returned HTTP {resp.status_code} on delete: {err}")
+
 def fetch_keys_from_proxy(endpoint, token, force=False):
     """GET /credential from the proxy worker. Returns (public_cert, private_key, generated_at_ms).
 
@@ -502,7 +521,40 @@ def key_invalid_after(priv_key_f):
     modified_time = int(os.path.getmtime(priv_key_f))
     return max(86400 - (curr_time - modified_time), 0) # number of seconds left for the key to expire
 
-def main(credentials_file=None, once=False, force=False):
+def do_delete_account(credentials_file, target_username):
+    """DELETE the proxy account for `target_username` (server-side + local token).
+    After this, the next normal run will re-register from scratch using whatever
+    password / OTP secret is in the file or prompted interactively."""
+    default_endpoint, users, legacy = load_config(credentials_file)
+    matched = [u for u in users if u.get('username') == target_username]
+    if not matched:
+        sys.exit(f"Error: no user `{target_username}` in {credentials_file}.")
+
+    for user_entry in matched:
+        endpoint = resolve_endpoint(user_entry, default_endpoint)
+        if not is_proxy_endpoint(endpoint):
+            print(f"[{target_username}] endpoint is `{endpoint}`, not a proxy URL — nothing to delete.")
+            continue
+
+        account = proxy_account_label(target_username, endpoint)
+        token = _read_proxy_token(account)
+        if token:
+            delete_proxy_account(endpoint, token)
+            print(f"[{target_username}] Server-side account on {endpoint} cleared.")
+        else:
+            print(f"[{target_username}] No local token for {endpoint}; skipping server-side DELETE.")
+
+        # Always wipe local token storage, even if the server response was iffy:
+        # the user asked us to forget this credential locally.
+        _keyring_delete(proxy_service_id, account)
+        _file_token_delete(account)
+        print(f"[{target_username}] Local token store cleared.")
+
+def main(credentials_file=None, once=False, force=False, delete_account=None):
+    if delete_account:
+        do_delete_account(credentials_file, delete_account)
+        return
+
     credential_folder = Path(__file__).parent
     # check if a file called pid exists in the same folder as the script
     # if it does, then the script is already running
@@ -600,5 +652,8 @@ if __name__ == "__main__":
     parser.add_argument('--once', action='store_true', help='Run the script only once')
     parser.add_argument('--force', action='store_true', help='Force the script to run even if the key is still valid')
     parser.add_argument('--credentials', type=str, help='Path to the credentials file', default=Path(__file__).parent / 'credential.json')
+    parser.add_argument('--delete-account', metavar='USERNAME', type=str,
+                        help='DELETE the proxy account for USERNAME on the worker and clear the local token, then exit. '
+                             'Re-register by running again with password / otp_secret in credential.json or interactively.')
     args = parser.parse_args()
-    exit(main(args.credentials, args.once, args.force))
+    exit(main(args.credentials, args.once, args.force, args.delete_account))
