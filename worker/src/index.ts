@@ -1,4 +1,4 @@
-// Cloudflare Worker — per-user encrypted CSCS key proxy. (api: v2)
+// Cloudflare Worker — per-user encrypted CSCS key proxy. (api: v2.1; force=1)
 //
 // Each user POSTs their CSCS credentials encrypted with a token of their
 // choosing; the Worker stores only opaque ciphertext in KV. On GET, the
@@ -237,7 +237,7 @@ async function handleDeleteAccount(env: Env, token: string): Promise<Response> {
   return new Response(null, { status: 204 });
 }
 
-async function handleGetCredential(env: Env, token: string): Promise<Response> {
+async function handleGetCredential(env: Env, token: string, force: boolean): Promise<Response> {
   const kvKey = await kvKeyForToken(token, env);
   const blob = await env.CERT_STORE.get(kvKey);
   if (!blob) return jsonResponse({ error: "no account for this token" }, 401);
@@ -247,11 +247,25 @@ async function handleGetCredential(env: Env, token: string): Promise<Response> {
 
   const now = Date.now();
   const cached = record.cached_cert;
-  if (cached && now - cached.generated_at < CACHE_LIFETIME_MS) {
+  if (!force && cached && now - cached.generated_at < CACHE_LIFETIME_MS) {
     return jsonResponse(cached);
   }
 
-  // Stale or missing — refresh from CSCS.
+  // Force path: per-token rate-limit so a repeated force=1 can't hammer CSCS.
+  // Normal stale-refresh path skips the lock since at most one expiry happens
+  // per ~23h per token anyway.
+  if (force) {
+    const lockKey = kvKey + ":force-lock";
+    if (await env.CERT_STORE.get(lockKey)) {
+      return jsonResponse(
+        { error: "force-refresh rate-limited; try again in up to 60s" },
+        429,
+      );
+    }
+    await env.CERT_STORE.put(lockKey, "1", { expirationTtl: 60 });
+  }
+
+  // Stale or forced — refresh from CSCS.
   let fresh: { key: string; cert: string };
   try {
     fresh = await fetchKeysFromCSCS(record);
@@ -296,7 +310,9 @@ export default {
       return handleDeleteAccount(env, token);
     }
     if (url.pathname === "/credential" && req.method === "GET") {
-      return handleGetCredential(env, token);
+      const f = url.searchParams.get("force");
+      const force = f === "1" || f === "true";
+      return handleGetCredential(env, token, force);
     }
 
     return jsonResponse({ error: "not found" }, 404);

@@ -61,12 +61,13 @@ chosen by the caller. Tokens have no server-side enrolment step — the
 first `POST /account` with a given token implicitly creates the
 account.
 
-| Method   | Path           | Body                                         | Behaviour                                                                                                |
-|----------|----------------|----------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| `GET`    | `/`            | —                                            | liveness; no auth.                                                                                       |
-| `POST`   | `/account`     | `{ "username", "password", "otp_secret" }`   | Encrypts the body and stores it under `HMAC(PEPPER, "user:"+token)`. Overwrites any prior record.        |
-| `DELETE` | `/account`     | —                                            | Deletes the KV record for this token. 204 even if no record existed (idempotent).                        |
-| `GET`    | `/credential`  | —                                            | Returns `{ key, cert, generated_at }`. If the cached cert is older than 23h, the Worker refreshes it.    |
+| Method   | Path                       | Body                                         | Behaviour                                                                                                |
+|----------|----------------------------|----------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| `GET`    | `/`                        | —                                            | liveness; no auth.                                                                                       |
+| `POST`   | `/account`                 | `{ "username", "password", "otp_secret" }`   | Encrypts the body and stores it under `HMAC(PEPPER, "user:"+token)`. Overwrites any prior record.        |
+| `DELETE` | `/account`                 | —                                            | Deletes the KV record for this token. 204 even if no record existed (idempotent).                        |
+| `GET`    | `/credential`              | —                                            | Returns `{ key, cert, generated_at }`. If the cached cert is older than 23h, the Worker refreshes it.    |
+| `GET`    | `/credential?force=1`      | —                                            | Same as above but ignores the cache and always hits CSCS. Useful after revoking the cert in the CSCS dashboard. Per-token rate-limited to 1/min (returns 429 if exceeded). |
 
 `POST /account` request body:
 

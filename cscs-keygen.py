@@ -288,12 +288,18 @@ def register_proxy_account(endpoint, token, username, password, otp_secret):
             err = resp.text
         sys.exit(f"Error: proxy returned HTTP {resp.status_code}: {err}")
 
-def fetch_keys_from_proxy(endpoint, token):
+def fetch_keys_from_proxy(endpoint, token, force=False):
     """GET /credential from the proxy worker. Returns (public_cert, private_key, generated_at_ms).
 
     generated_at_ms is when the worker fetched the cert from CSCS, used to anchor
-    local mtime to the CSCS-side creation time instead of this fetch time."""
+    local mtime to the CSCS-side creation time instead of this fetch time.
+
+    If `force` is True, appends ?force=1 so the worker bypasses its own cache
+    and always hits CSCS — for use after revoking the cert in the CSCS
+    dashboard. The worker rate-limits force-refresh to 1/min per token."""
     url = endpoint.rstrip('/') + '/credential'
+    if force:
+        url += '?force=1'
     print(f"Fetching keys from proxy {url}")
     try:
         resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, timeout=30)
@@ -303,6 +309,11 @@ def fetch_keys_from_proxy(endpoint, token):
         sys.exit(
             "Error: proxy rejected token. The local token may be stale; delete the keyring entry "
             f"`{proxy_service_id}` for this user and re-run to re-register."
+        )
+    if resp.status_code == 429:
+        sys.exit(
+            "Error: proxy rate-limited the force-refresh. Wait up to 60s before retrying with --force, "
+            "or drop --force to read the currently-cached cert."
         )
     if not resp.ok:
         try:
@@ -550,7 +561,7 @@ def main(credentials_file=None, once=False, force=False):
             if is_proxy_endpoint(endpoint):
                 token, dirty = ensure_proxy_account(user_entry, endpoint)
                 had_any_file_secret = had_any_file_secret or dirty
-                public, private, generated_at = fetch_keys_from_proxy(endpoint, token)
+                public, private, generated_at = fetch_keys_from_proxy(endpoint, token, force=force)
                 save_keys(public, private, key_name, generated_at)
                 print(f"[{username}] Keys saved to {ssh_folder / key_name}")
             else:
