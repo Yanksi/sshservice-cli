@@ -3,13 +3,13 @@ main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
 # KV namespace holds per-user encrypted blobs keyed by HMAC(PEPPER, "user:" + token).
-# The id below is a syntactically valid placeholder. The Deploy-to-Cloudflare
-# button provisions a real namespace at deploy time and rewrites this id; for
-# manual `wrangler deploy`, replace it with the value printed by
-# `npx wrangler kv namespace create CERT_STORE`.
+# This id is the namespace provisioned for Yanksi's account when the Worker
+# was first deployed via the button. Anyone forking this repo to deploy their
+# own Worker should replace it with the id printed by
+# `npx wrangler kv namespace create CERT_STORE` against their own account.
 [[kv_namespaces]]
 binding = "CERT_STORE"
-id = "00000000000000000000000000000000"
+id = "2832c9b911d0461eaa02721f2f59ae5b"
 
 # No cron triggers in the new design — refresh happens lazily on
 # GET /credential. Declared explicitly so wrangler removes any cron left
