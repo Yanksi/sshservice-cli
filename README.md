@@ -95,14 +95,20 @@ will prompt for the password / OTP seed (or read them from
 `credential.json`), register the account on the Worker, and stash the
 auto-generated bearer token locally.
 
-For a `.bashrc` snippet that refreshes the cert in the background only when
-it's about to expire:
+For a `.bashrc` snippet that refreshes the cert at every shell start —
+fast in proxy mode (a single ~10–40 ms HTTP roundtrip to the worker, which
+serves its own ~23h cache) and a no-op for direct users whose local cert
+is still valid:
 
 ```bash
 if [ -x "$HOME/sshservice-cli/cscs-keygen.py" ]; then
-    python "$HOME/sshservice-cli/cscs-keygen.py" --once >/dev/null 2>&1 &
+    uv run "$HOME/sshservice-cli/cscs-keygen.py" --once >/dev/null 2>&1 &
 fi
 ```
+
+In proxy mode the script always hits the worker — the local mtime gate
+is intentionally bypassed so the local cert can never go stale relative
+to what the worker has, regardless of when the script last ran.
 
 ## Re-registering / rotating tokens
 

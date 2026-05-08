@@ -590,33 +590,29 @@ def main(credentials_file=None, once=False, force=False, delete_account=None):
         save_config_file(credentials_file, default_endpoint, users, legacy)
 
     while True:
-        min_time_left = min(
-            key_invalid_after(ssh_folder / resolve_key_name(u, legacy))
-            for u in users
-        )
-        if min_time_left > 0 and not force:
-            print("The key is still valid for " + str(min_time_left) + " seconds.")
-            if once:
-                break
-            time.sleep(min_time_left + 10) # sleep for 10 seconds more than the time left
-
         had_any_file_secret = False
         for user_entry in users:
-            key_name = resolve_key_name(user_entry, legacy)
-            time_left = key_invalid_after(ssh_folder / key_name)
-            if time_left > 0 and not force:
-                continue
-
             endpoint = resolve_endpoint(user_entry, default_endpoint)
             username = user_entry['username']
+            key_name = resolve_key_name(user_entry, legacy)
 
             if is_proxy_endpoint(endpoint):
+                # Proxy users always fetch — the worker handles its own
+                # 23h cache, so the local mtime gate is redundant. This
+                # also makes `cscs-keygen.py --once` from .bashrc trivial:
+                # every shell start ends up with the worker's current
+                # cert, no "did I refresh recently?" reasoning required.
                 token, dirty = ensure_proxy_account(user_entry, endpoint)
                 had_any_file_secret = had_any_file_secret or dirty
                 public, private, generated_at = fetch_keys_from_proxy(endpoint, token, force=force)
                 save_keys(public, private, key_name, generated_at)
                 print(f"[{username}] Keys saved to {ssh_folder / key_name}")
             else:
+                # Direct users: respect the local mtime so we don't burn
+                # the 5-key quota on unnecessary re-fetches.
+                time_left = key_invalid_after(ssh_folder / key_name)
+                if time_left > 0 and not force:
+                    continue
                 user, pwd, otp, had_file_secret = get_user_credentials(user_entry)
                 had_any_file_secret = had_any_file_secret or had_file_secret
                 public, private = get_keys(user, pwd, otp)
@@ -627,9 +623,19 @@ def main(credentials_file=None, once=False, force=False, delete_account=None):
             print("Cleaning up secrets from file...")
             save_config_file(credentials_file, default_endpoint, users, legacy)
 
+        # Always report the resulting min validity so autotask.ps1 can parse
+        # it to schedule the next wake-up — including after a fresh fetch,
+        # which the previous flow skipped past in --once mode.
+        min_time_left = min(
+            key_invalid_after(ssh_folder / resolve_key_name(u, legacy))
+            for u in users
+        )
+        print(f"The key is still valid for {min_time_left} seconds.")
+
         if once or force:
             break
-        # Otherwise loop: the next iteration's validity-check sleep handles cadence.
+        # Daemon mode: wait until the soonest local expiry, then loop.
+        time.sleep(min_time_left + 10)
 
 #     message = """
 
