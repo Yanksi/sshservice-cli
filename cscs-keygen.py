@@ -321,20 +321,42 @@ def fetch_keys_from_proxy(endpoint, token):
 def ensure_proxy_account(user_entry, endpoint):
     """Ensure the worker has an account for this user. Returns (token, file_dirty).
 
-    If a token already exists locally for (username, endpoint), returns it.
-    Otherwise gathers password + OTP secret (file → migrate-and-prompt fallback),
-    generates a fresh token, registers with the worker, stores the token, and
-    erases any locally-cached password/OTP keyring entries for this user since
-    they now live encrypted on the worker."""
+    Resolution order:
+      1. Existing token cached locally for (username, endpoint).
+      2. Token explicitly provided in the config file (e.g. copied over from
+         another device that already registered). Migrated to local store and
+         stripped from the file.
+      3. Register a fresh account: gather password + OTP seed (file →
+         direct-mode keyring → interactive prompt fallback), generate a 256-bit
+         bearer token, POST /account, store the token. The token is printed to
+         stdout so the user can re-use it on other devices, and any
+         locally-cached direct-mode password / OTP keyring entries are erased
+         since they now live only on the worker.
+    """
     username = user_entry['username']
     account = proxy_account_label(username, endpoint)
     file_dirty = False
 
     existing = _read_proxy_token(account)
     if existing:
+        # Defensive cleanup: if the file still has plaintext secrets from a
+        # previous setup, strip them now that the token is local.
+        leftover_keys = [k for k in ('password', 'otp_secret', 'token') if k in user_entry]
+        if leftover_keys:
+            for k in leftover_keys:
+                user_entry.pop(k, None)
+            file_dirty = True
         return existing, file_dirty
 
-    # No local token for this (user, endpoint) — register a new account.
+    # Path 2: token supplied in the file (user shared it from another device).
+    if user_entry.get('token'):
+        token = user_entry.pop('token')
+        file_dirty = True
+        _store_proxy_token(account, token)
+        print(f"[{username}] Adopted token from credential file; will fetch using existing proxy account.")
+        return token, file_dirty
+
+    # Path 3: register a new account.
     print(f"[{username}] No proxy token cached locally for {endpoint}; registering a new account.")
 
     # Resolve password.
@@ -378,6 +400,22 @@ def ensure_proxy_account(user_entry, endpoint):
     token = secrets.token_urlsafe(32)
     register_proxy_account(endpoint, token, username, password, otp_secret)
     _store_proxy_token(account, token)
+
+    # Print the token so the user can re-use this account on other devices.
+    # It's the only time we surface the token in plaintext.
+    border = "=" * 70
+    print()
+    print(border)
+    print(f"[{username}] Registered new proxy account on {endpoint}")
+    print(f"[{username}] Proxy token (save this to use the SAME account on other devices):")
+    print()
+    print(f"    {token}")
+    print()
+    print(f"[{username}] On another device, add it under this user's entry in credential.json:")
+    print(f'[{username}]   {{ "username": "{username}", "endpoint": "{endpoint}", "token": "<paste>" }}')
+    print(f"[{username}] The token will be moved to the keyring on first run and stripped from the file.")
+    print(border)
+    print()
 
     # Wipe locally-cached CSCS secrets for this user — they only live on the worker now.
     _keyring_delete(service_id, username)

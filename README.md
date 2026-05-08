@@ -46,10 +46,35 @@ strips them from the file.
 | Endpoint        | What happens to the password / OTP seed                                                                |
 |-----------------|--------------------------------------------------------------------------------------------------------|
 | `cscs`          | Stored in the OS keyring (`cscs-keygen` service). Subsequent runs read them from there.                |
-| Proxy URL       | A random bearer token is generated. The script POSTs the credentials encrypted-at-rest to the Worker, then keeps **only the token** locally (in keyring, or `~/.config/cscs-keygen/token-<...>` if no keyring backend). The local password / OTP entries are wiped — they live only on the Worker from then on. |
+| Proxy URL       | A random 256-bit bearer token is generated. The script POSTs the credentials encrypted-at-rest to the Worker, then keeps **only the token** locally (in keyring, or `~/.config/cscs-keygen/token-<...>` if no keyring backend). The local password / OTP entries are wiped — they live only on the Worker from then on. The generated token is printed once at the end of the registration so you can copy it to other devices. |
 
 After the first run, `credential.json` contains only `username`, `endpoint`,
 and (optionally) `key_name` for each user. No secrets remain on disk.
+
+### Sharing a proxy account across devices
+
+The first device a user registers from prints something like:
+
+```
+======================================================================
+[lshuhao] Registered new proxy account on https://cscs-key-proxy.<sub>.workers.dev
+[lshuhao] Proxy token (save this to use the SAME account on other devices):
+
+    AbC...64-char-url-safe-string
+
+[lshuhao] On another device, add it under this user's entry in credential.json:
+[lshuhao]   { "username": "lshuhao", "endpoint": "https://...", "token": "<paste>" }
+======================================================================
+```
+
+On the second (and subsequent) devices, put that token in `credential.json`
+under the matching user entry as `"token": "..."`. The script imports it
+into the keyring on first run and strips it from the file — no password /
+OTP prompt, no extra `POST /account` call.
+
+If you lose the token, just delete the user's row on the Worker (`DELETE
+/account` from any device that still has the token) and re-register from
+any device — a fresh token gets generated.
 
 ## Proxy mode (one-time Worker deploy)
 
