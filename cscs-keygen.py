@@ -31,6 +31,7 @@
 import getpass
 import requests
 import os
+import secrets
 import sys
 import time
 import json
@@ -47,16 +48,22 @@ service_id = 'cscs-keygen'
 proxy_service_id = 'cscs-keygen_proxy'
 ssh_folder = Path(os.path.expanduser("~")) / '.ssh'
 priv_key_name = 'cscs-key'
-proxy_token_fallback = Path(os.path.expanduser("~")) / '.config' / 'cscs-keygen' / 'proxy_token'
+proxy_token_fallback_dir = Path(os.path.expanduser("~")) / '.config' / 'cscs-keygen'
+
+# Sentinel value used in the `endpoint` field to mean "talk to CSCS directly".
+# Anything else is treated as a proxy URL.
+DIRECT_ENDPOINT = 'cscs'
 
 #Methods:
 def load_config(fname):
-    """Load the credentials file. Returns (mode, proxy, users, legacy).
+    """Load the credentials file. Returns (default_endpoint, users, legacy).
 
-    Supports three file shapes:
-      - legacy single-user:  {"username": "...", "password": "...", "otp_secret": "..."}
-      - multi-user direct:   {"users": [{"username": "...", ...}, ...]}
-      - proxy fetcher:       {"mode": "proxy", "proxy": {"url": "...", "token": "..."}}
+    Supports two file shapes:
+      - legacy single-user:  {"username": "...", "endpoint": "...", "password": "...", "otp_secret": "..."}
+      - multi-user:          {"endpoint": "...", "users": [{"username": "...", "endpoint": "...", ...}, ...]}
+
+    `endpoint` is "cscs" (or absent → defaults to "cscs") for direct-to-CSCS
+    auth, or a proxy URL like "https://cscs-key-proxy.<sub>.workers.dev".
     """
     data = {}
     if fname is not None and fname.exists():
@@ -67,24 +74,31 @@ def load_config(fname):
         except Exception:
             pass
 
-    mode = data.get('mode', 'direct') if isinstance(data, dict) else 'direct'
-    proxy = data.get('proxy') if isinstance(data, dict) else None
-    if not isinstance(proxy, dict):
-        proxy = {}
+    if not isinstance(data, dict):
+        data = {}
 
-    if isinstance(data, dict) and isinstance(data.get('users'), list):
+    default_endpoint = data.get('endpoint', DIRECT_ENDPOINT) or DIRECT_ENDPOINT
+
+    if isinstance(data.get('users'), list):
         users, legacy = list(data['users']), False
     else:
-        # Legacy / empty file: treat as a single-user entry
+        # Legacy single-user file: top-level fields belong to one user entry.
         legacy_entry = {
-            k: v for k, v in (data.items() if isinstance(data, dict) else [])
-            if k in ('username', 'password', 'otp_secret', 'key_name')
+            k: v for k, v in data.items()
+            if k in ('username', 'password', 'otp_secret', 'key_name', 'endpoint')
         }
         users, legacy = [legacy_entry], True
 
-    return mode, proxy, users, legacy
+    return default_endpoint, users, legacy
 
-def save_config_file(fname, mode, proxy, users, legacy):
+def resolve_endpoint(user_entry, default_endpoint):
+    """Per-user `endpoint` overrides the top-level default."""
+    return user_entry.get('endpoint') or default_endpoint or DIRECT_ENDPOINT
+
+def is_proxy_endpoint(endpoint):
+    return endpoint and endpoint != DIRECT_ENDPOINT
+
+def save_config_file(fname, default_endpoint, users, legacy):
     """Persist non-secret config back to disk. Secrets live only in the keyring
     (or the chmod-600 fallback file when keyring is unavailable)."""
     if not fname:
@@ -96,18 +110,25 @@ def save_config_file(fname, mode, proxy, users, legacy):
         entry = {'username': u['username']}
         if 'key_name' in u:
             entry['key_name'] = u['key_name']
+        # Preserve per-user endpoint only when it differs from the top-level default.
+        ep = u.get('endpoint')
+        if ep and ep != default_endpoint:
+            entry['endpoint'] = ep
         cleaned_users.append(entry)
 
-    if mode == 'proxy':
-        out = {'mode': 'proxy'}
-        if proxy.get('url'):
-            out['proxy'] = {'url': proxy['url']}
-            if proxy.get('key_name'):
-                out['proxy']['key_name'] = proxy['key_name']
-    elif legacy and len(cleaned_users) == 1:
-        out = cleaned_users[0]
+    if legacy and len(cleaned_users) == 1:
+        # Legacy single-user shape: flatten endpoint to top level if non-default.
+        out = {'username': cleaned_users[0]['username']}
+        if 'key_name' in cleaned_users[0]:
+            out['key_name'] = cleaned_users[0]['key_name']
+        ep = users[0].get('endpoint') or default_endpoint
+        if ep and ep != DIRECT_ENDPOINT:
+            out['endpoint'] = ep
     else:
-        out = {'users': cleaned_users}
+        out = {}
+        if default_endpoint and default_endpoint != DIRECT_ENDPOINT:
+            out['endpoint'] = default_endpoint
+        out['users'] = cleaned_users
 
     try:
         with open(fname, 'w') as f:
@@ -180,7 +201,7 @@ def _keyring_set(service, account, secret):
         keyring.set_password(service, account, secret)
         return True
     except Exception as e:
-        print(f"Keyring unavailable ({e}); falling back to {proxy_token_fallback}.")
+        print(f"Keyring unavailable ({e}); falling back to {proxy_token_fallback_dir}.")
         return False
 
 def _keyring_get(service, account):
@@ -190,82 +211,179 @@ def _keyring_get(service, account):
     except Exception:
         return None
 
-def _file_token_read():
-    if not proxy_token_fallback.exists():
-        return None
+def _keyring_delete(service, account):
+    """Best-effort delete from keyring. Silent on missing entries or backend failure."""
     try:
-        return proxy_token_fallback.read_text().strip() or None
-    except Exception:
-        return None
-
-def _file_token_write(token):
-    proxy_token_fallback.parent.mkdir(parents=True, exist_ok=True)
-    proxy_token_fallback.write_text(token)
-    try:
-        os.chmod(proxy_token_fallback, 0o600)
+        keyring.delete_password(service, account)
     except Exception:
         pass
 
-def get_proxy_token(proxy):
-    """Resolve the proxy fetch token. Prefers keyring; falls back to a chmod-600
-    file at ~/.config/cscs-keygen/proxy_token. On first run, migrates a token
-    found in the config file into whichever store is available, then signals
-    the caller to strip it from the config."""
-    url = proxy.get('url')
-    if not url:
-        sys.exit("Error: proxy mode requires `proxy.url` in the credentials file.")
+def _proxy_token_path(account):
+    """Per-account file path for the keyring fallback."""
+    # Use a stable, filesystem-safe filename derived from the account label.
+    safe = ''.join(c if c.isalnum() or c in '-._' else '_' for c in account)
+    return proxy_token_fallback_dir / f'token-{safe}'
 
-    account = url  # one token per proxy URL
+def _file_token_read(account):
+    fp = _proxy_token_path(account)
+    if not fp.exists():
+        return None
+    try:
+        return fp.read_text().strip() or None
+    except Exception:
+        return None
 
-    token = _keyring_get(proxy_service_id, account)
-    if token:
-        return token, False
+def _file_token_write(account, token):
+    fp = _proxy_token_path(account)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(token)
+    try:
+        os.chmod(fp, 0o600)
+    except Exception:
+        pass
 
-    token = _file_token_read()
-    if token:
-        return token, False
+def _file_token_delete(account):
+    fp = _proxy_token_path(account)
+    try:
+        fp.unlink(missing_ok=True)
+    except Exception:
+        pass
 
-    # Migration path: token still sitting in the config file from initial setup.
-    if proxy.get('token'):
-        token = proxy.pop('token')
-        if _keyring_set(proxy_service_id, account, token):
-            print("Migrated proxy token to keyring.")
-        else:
-            _file_token_write(token)
-            print(f"Stored proxy token at {proxy_token_fallback} (chmod 600).")
-        return token, True
-
-    # Last resort: prompt.
-    token = getpass.getpass("Proxy fetch token: ").strip()
-    if not token:
-        sys.exit("Error: proxy token is required.")
+def _store_proxy_token(account, token):
+    """Save token to keyring; fall back to chmod-600 file if keyring is unavailable."""
     if _keyring_set(proxy_service_id, account, token):
-        print("Stored proxy token in keyring.")
+        print(f"Stored proxy token in keyring (account={account}).")
     else:
-        _file_token_write(token)
-        print(f"Stored proxy token at {proxy_token_fallback} (chmod 600).")
-    return token, False
+        _file_token_write(account, token)
+        print(f"Stored proxy token at {_proxy_token_path(account)} (chmod 600).")
 
-def fetch_keys_from_proxy(proxy_url, token):
-    """GET /cert from the proxy worker. Returns (public_cert, private_key, generated_at_ms).
+def _read_proxy_token(account):
+    """Look up the proxy token by account label. Returns None if not present."""
+    t = _keyring_get(proxy_service_id, account)
+    if t:
+        return t
+    return _file_token_read(account)
+
+def proxy_account_label(username, endpoint):
+    """Stable label for keyring + fallback file lookups."""
+    return f"{username}::{endpoint}"
+
+def register_proxy_account(endpoint, token, username, password, otp_secret):
+    """POST /account to the proxy worker. Stores encrypted CSCS credentials there."""
+    url = endpoint.rstrip('/') + '/account'
+    print(f"[{username}] Registering account on proxy {url}")
+    try:
+        resp = requests.post(
+            url,
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            data=json.dumps({'username': username, 'password': password, 'otp_secret': otp_secret}),
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"Error: proxy registration failed: {e}")
+    if not resp.ok:
+        try:
+            err = resp.json().get('error', resp.text)
+        except Exception:
+            err = resp.text
+        sys.exit(f"Error: proxy returned HTTP {resp.status_code}: {err}")
+
+def fetch_keys_from_proxy(endpoint, token):
+    """GET /credential from the proxy worker. Returns (public_cert, private_key, generated_at_ms).
 
     generated_at_ms is when the worker fetched the cert from CSCS, used to anchor
-    local mtime to the CSCS-side creation time instead of this fetch time. None
-    if absent (older worker or unexpected payload)."""
-    url = proxy_url.rstrip('/') + '/cert'
+    local mtime to the CSCS-side creation time instead of this fetch time."""
+    url = endpoint.rstrip('/') + '/credential'
     print(f"Fetching keys from proxy {url}")
     try:
-        resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, timeout=15)
-        resp.raise_for_status()
+        resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, timeout=30)
     except requests.exceptions.RequestException as e:
         sys.exit(f"Error: proxy fetch failed: {e}")
+    if resp.status_code == 401:
+        sys.exit(
+            "Error: proxy rejected token. The local token may be stale; delete the keyring entry "
+            f"`{proxy_service_id}` for this user and re-run to re-register."
+        )
+    if not resp.ok:
+        try:
+            err = resp.json().get('error', resp.text)
+        except Exception:
+            err = resp.text
+        sys.exit(f"Error: proxy returned HTTP {resp.status_code}: {err}")
     body = resp.json()
     if not body.get('cert') or not body.get('key'):
-        sys.exit("Error: proxy returned no cert/key (worker may not have populated yet — try POST /refresh).")
+        sys.exit("Error: proxy returned no cert/key.")
     generated_at = body.get('generated_at')
     if not isinstance(generated_at, (int, float)):
         generated_at = None
     return body['cert'], body['key'], generated_at
+
+def ensure_proxy_account(user_entry, endpoint):
+    """Ensure the worker has an account for this user. Returns (token, file_dirty).
+
+    If a token already exists locally for (username, endpoint), returns it.
+    Otherwise gathers password + OTP secret (file → migrate-and-prompt fallback),
+    generates a fresh token, registers with the worker, stores the token, and
+    erases any locally-cached password/OTP keyring entries for this user since
+    they now live encrypted on the worker."""
+    username = user_entry['username']
+    account = proxy_account_label(username, endpoint)
+    file_dirty = False
+
+    existing = _read_proxy_token(account)
+    if existing:
+        return existing, file_dirty
+
+    # No local token for this (user, endpoint) — register a new account.
+    print(f"[{username}] No proxy token cached locally for {endpoint}; registering a new account.")
+
+    # Resolve password.
+    if 'password' in user_entry:
+        password = user_entry.pop('password')
+        file_dirty = True
+    else:
+        password = keyring.get_password(service_id, username)
+        if not password:
+            password = getpass.getpass(f"[{username}] CSCS password: ")
+
+    # Resolve OTP secret. Must be a TOTP seed (base32), not a 6-digit code,
+    # because the worker generates fresh codes on every refresh.
+    if 'otp_secret' in user_entry:
+        otp_secret = user_entry.pop('otp_secret')
+        file_dirty = True
+    else:
+        otp_secret = keyring.get_password(service_id + "_otp", username)
+        if not otp_secret:
+            while True:
+                inp = getpass.getpass(
+                    f"[{username}] CSCS TOTP secret (base32 seed, NOT a 6-digit code): "
+                ).strip()
+                if not inp:
+                    print("Input cannot be empty.")
+                    continue
+                try:
+                    pyotp.TOTP(inp).now()
+                except Exception:
+                    print("That doesn't look like a valid base32 TOTP seed. Try again.")
+                    continue
+                otp_secret = inp
+                break
+
+    # Validate the OTP secret one last time, regardless of source.
+    try:
+        pyotp.TOTP(otp_secret).now()
+    except Exception as e:
+        sys.exit(f"Error: stored OTP secret is not valid base32: {e}")
+
+    token = secrets.token_urlsafe(32)
+    register_proxy_account(endpoint, token, username, password, otp_secret)
+    _store_proxy_token(account, token)
+
+    # Wipe locally-cached CSCS secrets for this user — they only live on the worker now.
+    _keyring_delete(service_id, username)
+    _keyring_delete(service_id + "_otp", username)
+
+    return token, file_dirty
 
 def get_keys(username, password, otp):
     print(f"[{username}] Fetching keys from CSCS...")
@@ -357,36 +475,7 @@ def main(credentials_file=None, once=False, force=False):
         with open(pid_file, 'w') as f:
             f.write(str(os.getpid()))
 
-    mode, proxy, users, legacy = load_config(credentials_file)
-
-    if mode == 'proxy':
-        key_name = proxy.get('key_name') or priv_key_name
-        while True:
-            time_left = key_invalid_after(ssh_folder / key_name)
-            if time_left > 0 and not force:
-                print(f"The key is still valid for {time_left} seconds.")
-                if once:
-                    break
-                time.sleep(time_left + 10)
-                continue
-
-            token, migrated = get_proxy_token(proxy)
-            public, private, generated_at = fetch_keys_from_proxy(proxy['url'], token)
-            save_keys(public, private, key_name, generated_at)
-            print(f"Keys saved to {ssh_folder / key_name}")
-
-            if migrated:
-                print("Cleaning up token from file...")
-                save_config_file(credentials_file, mode, proxy, users, legacy)
-
-            if force:
-                break
-            # Loop back so the next iteration reports remaining validity
-            # (which autotask.ps1 parses to schedule its next wake-up).
-            continue
-        return
-
-    # mode == 'direct'
+    default_endpoint, users, legacy = load_config(credentials_file)
     if not users:
         users = [{}]
 
@@ -397,7 +486,7 @@ def main(credentials_file=None, once=False, force=False):
             user_entry['username'] = input("Username: ").strip()
             file_dirty = True
     if file_dirty:
-        save_config_file(credentials_file, mode, proxy, users, legacy)
+        save_config_file(credentials_file, default_endpoint, users, legacy)
 
     while True:
         min_time_left = min(
@@ -416,18 +505,30 @@ def main(credentials_file=None, once=False, force=False):
             time_left = key_invalid_after(ssh_folder / key_name)
             if time_left > 0 and not force:
                 continue
-            user, pwd, otp, had_file_secret = get_user_credentials(user_entry)
-            had_any_file_secret = had_any_file_secret or had_file_secret
-            public, private = get_keys(user, pwd, otp)
-            save_keys(public, private, key_name)
-            print(f"[{user}] Keys saved to {ssh_folder / key_name}")
+
+            endpoint = resolve_endpoint(user_entry, default_endpoint)
+            username = user_entry['username']
+
+            if is_proxy_endpoint(endpoint):
+                token, dirty = ensure_proxy_account(user_entry, endpoint)
+                had_any_file_secret = had_any_file_secret or dirty
+                public, private, generated_at = fetch_keys_from_proxy(endpoint, token)
+                save_keys(public, private, key_name, generated_at)
+                print(f"[{username}] Keys saved to {ssh_folder / key_name}")
+            else:
+                user, pwd, otp, had_file_secret = get_user_credentials(user_entry)
+                had_any_file_secret = had_any_file_secret or had_file_secret
+                public, private = get_keys(user, pwd, otp)
+                save_keys(public, private, key_name)
+                print(f"[{user}] Keys saved to {ssh_folder / key_name}")
 
         if had_any_file_secret:
             print("Cleaning up secrets from file...")
-            save_config_file(credentials_file, mode, proxy, users, legacy)
+            save_config_file(credentials_file, default_endpoint, users, legacy)
 
-        if force:
+        if once or force:
             break
+        # Otherwise loop: the next iteration's validity-check sleep handles cadence.
 
 #     message = """
 
