@@ -1,157 +1,169 @@
 # cscs-key-proxy (Cloudflare Worker)
 
-A tiny Cloudflare Worker that holds your CSCS credentials, refreshes the
-short-lived SSH key+cert from the CSCS sshservice on a cron schedule, and
-serves the latest cert to authorised client devices over HTTPS.
+A Cloudflare Worker that brokers CSCS-signed SSH keys for one or more users
+without storing standing CSCS credentials. Each user POSTs their CSCS
+credentials encrypted with a bearer token of their choosing; the Worker
+keeps only opaque ciphertext in KV. On `GET /credential`, the Worker
+decrypts with the supplied token, fetches a fresh cert from CSCS if the
+cached one is older than 23h, re-encrypts, and returns the plaintext key+cert.
 
-This exists to work around CSCS's 5-keys-per-account quota: instead of every
-device/cluster running `cscs-keygen.py` and burning a slot, only the Worker
-talks to CSCS, and every device fetches the same cert from the Worker.
+This solves CSCS's 5-keys-per-account quota (one issued cert across all your
+machines, regardless of count) and lets you and your colleagues share the
+same Worker without sharing CSCS credentials with each other.
 
-## Security tradeoff (read this)
+## Security model — what this does and does not give you
 
-The Worker stores your **CSCS username + password + TOTP seed** as Worker
-secrets. That is a meaningful escalation from running `cscs-keygen.py`
-locally:
+**Threats this defends against:**
 
-- **Local:** an attacker who steals the cert has 24h of access.
-- **Worker:** an attacker who compromises the Worker (Cloudflare account
-  takeover, leaked secrets, malicious dependency) has *persistent* CSCS access
-  until you rotate the password and TOTP seed.
+- A KV dump alone reveals nothing actionable. Each blob is AES-GCM-256
+  encrypted; the key is `HKDF(salt=PEPPER, ikm=token)` and the KV index
+  is `HMAC(PEPPER, "user:" + token)` — without both `WORKER_PEPPER` and a
+  valid bearer token, an attacker can't even tell which blob belongs to
+  whom.
+- The Worker has no standing access to anyone's CSCS account. It can
+  only act on behalf of a token holder, and only while a request is in
+  flight.
+- Multi-tenant by construction: each token is its own isolated record.
+  A leaked token compromises exactly one CSCS account, not everyone's.
 
-The upside is one issued cert across all your devices, well under the quota.
-Deploy this only if you're comfortable with that tradeoff. Cloudflare secrets
-are encrypted at rest and not visible in logs, but they are exfiltrable by
-anyone with write access to the Worker code.
+**Threats this does NOT defend against:**
+
+- The Worker briefly handles plaintext credentials in memory while
+  refreshing from CSCS (it has to, to compute the TOTP and call the
+  sshservice). An attacker who can modify the Worker code can exfiltrate
+  plaintext at that moment. **Trust in the Worker operator (whoever
+  controls the Cloudflare account) is required.**
+- A leaked bearer token gives full access to that user's CSCS account
+  for as long as the token is valid. Treat tokens like passwords.
+- Cloudflare has full visibility into request bodies. Don't deploy this
+  to a Cloudflare account you don't trust.
+- This is **encrypted-at-rest**, not zero-knowledge in the strict
+  cryptographic sense (the Worker sees plaintext during the refresh
+  step). The README intentionally avoids the "zero-knowledge" label for
+  that reason.
+
+If those tradeoffs aren't acceptable, run `cscs-keygen.py` directly on
+each device instead — at the cost of the 5-key quota.
 
 ## What gets deployed
 
-- **One Worker** with two HTTP endpoints and a cron trigger.
-- **One KV namespace** holding the latest `{ key, cert, generated_at }` JSON.
-- **Four Worker secrets** that you set after deploy: `CSCS_USERNAME`,
-  `CSCS_PASSWORD`, `CSCS_OTP_SECRET`, `FETCH_TOKEN`.
-
-The cron fires every 12h (`0 */12 * * *`). CSCS certs are valid for 24h.
+- **One Worker** with three HTTP endpoints (POST/GET/DELETE). No cron.
+- **One KV namespace** holding per-user `AES-GCM(record)` blobs.
+- **One Worker secret** — `WORKER_PEPPER`, 32 bytes of randomness in hex,
+  generated once and never rotated. Rotating it makes every existing
+  encrypted blob unrecoverable.
 
 ## HTTP API
 
-All non-`/` routes require `Authorization: Bearer <FETCH_TOKEN>`.
+All `/account` and `/credential` routes require
+`Authorization: Bearer <token>` where `<token>` is the per-user secret
+chosen by the caller. Tokens have no server-side enrolment step — the
+first `POST /account` with a given token implicitly creates the
+account.
 
-| Method | Path       | Description                                         |
-|--------|------------|-----------------------------------------------------|
-| `GET`  | `/`        | Liveness check; no auth.                            |
-| `GET`  | `/cert`    | Returns the current cert as JSON.                   |
-| `POST` | `/refresh` | Force a fresh fetch from CSCS. Rate-limited to 1/min. |
+| Method   | Path           | Body                                         | Behaviour                                                                                                |
+|----------|----------------|----------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| `GET`    | `/`            | —                                            | liveness; no auth.                                                                                       |
+| `POST`   | `/account`     | `{ "username", "password", "otp_secret" }`   | Encrypts the body and stores it under `HMAC(PEPPER, "user:"+token)`. Overwrites any prior record.        |
+| `DELETE` | `/account`     | —                                            | Deletes the KV record for this token. 204 even if no record existed (idempotent).                        |
+| `GET`    | `/credential`  | —                                            | Returns `{ key, cert, generated_at }`. If the cached cert is older than 23h, the Worker refreshes it.    |
 
-`GET /cert` response shape:
+`POST /account` request body:
 
 ```json
 {
-  "key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...",
-  "cert": "ssh-ed25519-cert-v01@openssh.com AAAA... lshuhao",
+  "username":   "lshuhao",
+  "password":   "...",
+  "otp_secret": "JBSWY3DPEHPK3PXP"   // base32 TOTP seed, NOT a 6-digit code
+}
+```
+
+`GET /credential` response:
+
+```json
+{
+  "key":          "-----BEGIN OPENSSH PRIVATE KEY-----\n...",
+  "cert":         "ssh-ed25519-cert-v01@openssh.com AAAA... lshuhao",
   "generated_at": 1746559200000
 }
 ```
 
-## Deploy via the button (recommended)
+Errors are JSON of the form `{ "error": "..." }` with conventional
+status codes (`400` malformed body, `401` missing/invalid token, `502`
+upstream CSCS error, `500` Worker misconfigured).
 
-The button is in the top-level [README](../README.md). It targets the
-auto-generated `worker` branch, which is a flat-layout mirror of this
-directory (see [.github/workflows/mirror-worker-branch.yml](../.github/workflows/mirror-worker-branch.yml))
-because Cloudflare's deploy UI works most reliably with `wrangler.toml` at
+## Deploying
+
+The button in the top-level [README](../README.md) targets the
+auto-generated `worker` branch (a flat-layout mirror of this directory;
+see [.github/workflows/mirror-worker-branch.yml](../.github/workflows/mirror-worker-branch.yml)).
+The Cloudflare deploy UI works most reliably with `wrangler.toml` at
 the repository root.
-
-The walkthrough below is one-time setup; afterwards every push to `main`
-that touches `worker/` redeploys automatically through Cloudflare Workers
-Builds.
 
 ### 1. Click the button
 
-The Cloudflare UI will:
+Cloudflare will fork the repo, install the Cloudflare GitHub App if
+needed, provision the KV namespace declared in `wrangler.toml`
+(rewriting the all-zeros placeholder id), build, and deploy.
 
-- Authenticate you with Cloudflare (and prompt to install the Cloudflare
-  GitHub App if it isn't already).
-- Fork the repo into your account.
-- Provision the KV namespace declared in `wrangler.toml`. The placeholder
-  `id = "0000…"` value is rewritten with the real id during deploy.
-- Build and deploy the Worker, register the cron.
+### 2. Set the `WORKER_PEPPER` secret
 
-### 2. Set the secrets manually
+The button does not prompt for secrets. Set it manually:
 
-The button **does not prompt for secrets** — it only ever prompts for
-plaintext `[vars]` declared in `wrangler.toml`, which secrets are not. Set
-them in the dashboard right after deploy:
+1. **Cloudflare dashboard** → **Workers & Pages** → click the Worker.
+2. **Settings** → **Variables and Secrets** → **Add variable**, type
+   **Secret**.
+3. Name: `WORKER_PEPPER`. Value: 32 bytes of randomness in hex —
+   generate locally with `openssl rand -hex 32` and paste.
 
-1. **Cloudflare dashboard** → **Workers & Pages** → click your Worker.
-2. **Settings** → **Variables and Secrets** → **Add variable**.
-3. For each row below, set the **Type** to **Secret** and click Save:
+Until this is set, every authenticated route returns 500 with a clear
+message. After it's set, the Worker is ready to accept registrations.
 
-   | Name                | Value                                                                |
-   |---------------------|----------------------------------------------------------------------|
-   | `CSCS_USERNAME`     | Your CSCS username                                                   |
-   | `CSCS_PASSWORD`     | Your CSCS password                                                   |
-   | `CSCS_OTP_SECRET`   | Your TOTP **seed** (base32). Not a 6-digit code.                     |
-   | `FETCH_TOKEN`       | A random bearer token; e.g. `openssl rand -hex 32`. Save a copy — clients need it. |
+### 3. Hand out the URL to users
 
-Until all four are present, the cron will error on every tick with a
-clear log line in the Worker's "Logs" tab.
+Each user generates their own bearer token (e.g. `openssl rand -hex 32`),
+keeps it secret, and registers their own CSCS credentials. They never
+need to share their token with you, the Worker operator, or each other.
 
-### 3. Trigger the first refresh
-
-The next cron is up to 12 hours away, so kick off a refresh manually so
-clients have something to fetch immediately:
+A user's first call:
 
 ```bash
-curl -X POST -H "Authorization: Bearer <FETCH_TOKEN>" \
-  https://cscs-key-proxy.<your-subdomain>.workers.dev/refresh
+TOKEN="<their token>"
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"username":"<cscs-user>","password":"<cscs-pwd>","otp_secret":"<base32-seed>"}' \
+     https://cscs-key-proxy.<sub>.workers.dev/account
 ```
 
-A `200` with `{ "key": "...", "cert": "...", "generated_at": ... }` means
-the whole pipeline (CSCS auth, TOTP generation, KV write) is healthy.
-Anything else: open the Worker's Logs tab in the dashboard and read the
-error.
+Then any time after that:
 
-### 4. Point clients at the Worker
-
-In each device's `credential.json`:
-
-```json
-{
-  "mode": "proxy",
-  "proxy": {
-    "url": "https://cscs-key-proxy.<your-subdomain>.workers.dev",
-    "token": "<FETCH_TOKEN>"
-  }
-}
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+     https://cscs-key-proxy.<sub>.workers.dev/credential
+# → { "key": "...", "cert": "...", "generated_at": ... }
 ```
-
-The token is moved into the OS keyring (or
-`~/.config/cscs-keygen/proxy_token` chmod-600 fallback) on the first
-`python cscs-keygen.py --once` and stripped from the file.
 
 ## Deploy manually (no button)
-
-If you'd rather skip the button and run wrangler yourself:
 
 ```bash
 cd worker
 npm install
 npx wrangler kv namespace create CERT_STORE     # paste the printed id into wrangler.toml
-npx wrangler secret put CSCS_USERNAME
-npx wrangler secret put CSCS_PASSWORD
-npx wrangler secret put CSCS_OTP_SECRET         # base32 seed, NOT a 6-digit code
-npx wrangler secret put FETCH_TOKEN             # e.g. `openssl rand -hex 32`
+npx wrangler secret put WORKER_PEPPER           # paste `openssl rand -hex 32`
 npx wrangler deploy
 ```
 
-Then trigger the first refresh as in step 3 above.
+## Operations
 
-## Rotating secrets
+**Rotating `WORKER_PEPPER`:** don't. It rederives every account's
+encryption key and KV index, so a rotation invalidates every existing
+record. If you really need to rotate, all users must re-`POST /account`.
 
-`FETCH_TOKEN` rotation: dashboard (or `wrangler secret put FETCH_TOKEN`),
-then update each client's keyring entry (or
-`~/.config/cscs-keygen/proxy_token` fallback).
+**Removing a user:** the user themselves can `DELETE /account` with their
+own token. There is no admin override (by design — the Worker operator
+should not be able to enumerate or delete user records).
 
-CSCS password / TOTP rotation: re-run `wrangler secret put CSCS_PASSWORD`
-/ `CSCS_OTP_SECRET`. The next cron tick (or a `POST /refresh`) picks up
-the new values.
+**Logs:** Cloudflare Worker logs (Workers & Pages → your Worker →
+Logs) show only path/method/status by default. Bodies and headers
+aren't logged. Avoid adding `console.log` of request bodies in this
+codebase.

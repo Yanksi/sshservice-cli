@@ -1,23 +1,64 @@
-// Cloudflare Worker that fetches CSCS-signed SSH key+cert on a schedule and
-// serves them to authorised clients. See ../README.md for deployment notes.
+// Cloudflare Worker — zero-knowledge-style CSCS key proxy.
+//
+// Each user POSTs their CSCS credentials encrypted with a token of their
+// choosing; the Worker stores only opaque ciphertext in KV. On GET, the
+// Worker decrypts with the supplied token, refreshes the CSCS-signed cert
+// if the cached one is stale, re-encrypts, and returns the plaintext
+// key+cert. The Worker holds no standing CSCS credentials and cannot
+// enumerate users without the WORKER_PEPPER secret.
+//
+// See ../README.md for the security model and the threats this does and
+// does not defend against.
 
 export interface Env {
   CERT_STORE: KVNamespace;
-  CSCS_USERNAME: string;
-  CSCS_PASSWORD: string;
-  CSCS_OTP_SECRET: string;
-  FETCH_TOKEN: string;
+  WORKER_PEPPER: string; // 32+ bytes, hex
 }
 
-interface StoredCert {
-  key: string;
-  cert: string;
-  generated_at: number;
+interface AccountRecord {
+  username: string;
+  password: string;
+  otp_secret: string;
+  cached_cert?: {
+    key: string;
+    cert: string;
+    generated_at: number;
+  };
 }
 
 const CSCS_API = "https://sshservice.cscs.ch/api/v1/auth/ssh-keys/signed-key";
-const KV_KEY = "current";
-const REFRESH_LOCK_KEY = "refresh:lock";
+const CACHE_LIFETIME_MS = 23 * 60 * 60 * 1000; // refresh anything older than 23h
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+// ---------- helpers: hex / base64 ----------
+
+function hexToBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) throw new Error("invalid hex length");
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+function bytesToHex(b: Uint8Array): string {
+  return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function bytesToB64(b: Uint8Array): string {
+  let s = "";
+  for (const byte of b) s += String.fromCharCode(byte);
+  return btoa(s);
+}
+
+function b64ToBytes(s: string): Uint8Array {
+  const raw = atob(s);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
 
 // ---------- TOTP (RFC 6238, SHA-1 / 30s / 6 digits) ----------
 
@@ -64,16 +105,76 @@ async function generateTOTP(secretBase32: string, now = Date.now()): Promise<str
   return (code % 1_000_000).toString().padStart(6, "0");
 }
 
+// ---------- per-token derivation ----------
+
+async function kvKeyForToken(token: string, env: Env): Promise<string> {
+  // KV key = HMAC-SHA256(PEPPER, "user:" + token), hex.
+  const pepper = hexToBytes(env.WORKER_PEPPER);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    pepper,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode("user:" + token));
+  return bytesToHex(new Uint8Array(sig));
+}
+
+async function deriveCryptKey(token: string, env: Env): Promise<CryptoKey> {
+  // HKDF(salt=PEPPER, ikm=token, info="aes-gcm-account") → AES-GCM 256.
+  const salt = hexToBytes(env.WORKER_PEPPER);
+  const ikm = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(token),
+    "HKDF",
+    false,
+    ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", salt, info: enc.encode("aes-gcm-account"), hash: "SHA-256" },
+    ikm,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptRecord(record: AccountRecord, token: string, env: Env): Promise<string> {
+  const key = await deriveCryptKey(token, env);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = enc.encode(JSON.stringify(record));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data));
+  // Stored format: base64(iv || ciphertext+tag).
+  const out = new Uint8Array(iv.length + ct.length);
+  out.set(iv, 0);
+  out.set(ct, iv.length);
+  return bytesToB64(out);
+}
+
+async function decryptRecord(blob: string, token: string, env: Env): Promise<AccountRecord | null> {
+  try {
+    const key = await deriveCryptKey(token, env);
+    const bytes = b64ToBytes(blob);
+    const iv = bytes.slice(0, 12);
+    const ct = bytes.slice(12);
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+    return JSON.parse(dec.decode(new Uint8Array(pt)));
+  } catch {
+    return null; // wrong token / tampered ciphertext / missing
+  }
+}
+
 // ---------- CSCS API ----------
 
-async function fetchKeysFromCSCS(env: Env): Promise<StoredCert> {
-  const otp = await generateTOTP(env.CSCS_OTP_SECRET);
+async function fetchKeysFromCSCS(record: AccountRecord): Promise<{ key: string; cert: string }> {
+  const otp = await generateTOTP(record.otp_secret);
   const resp = await fetch(CSCS_API, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
     body: JSON.stringify({
-      username: env.CSCS_USERNAME,
-      password: env.CSCS_PASSWORD,
+      username: record.username,
+      password: record.password,
       otp,
     }),
   });
@@ -82,70 +183,93 @@ async function fetchKeysFromCSCS(env: Env): Promise<StoredCert> {
     throw new Error(`CSCS API ${resp.status}: ${text.slice(0, 500)}`);
   }
   const body = (await resp.json()) as { public?: string; private?: string };
-  if (!body.public || !body.private) {
-    throw new Error("CSCS API returned empty key/cert");
-  }
-  return { key: body.private, cert: body.public, generated_at: Date.now() };
+  if (!body.public || !body.private) throw new Error("CSCS API returned empty key/cert");
+  return { key: body.private, cert: body.public };
 }
 
-async function refreshAndStore(env: Env): Promise<StoredCert> {
-  const stored = await fetchKeysFromCSCS(env);
-  await env.CERT_STORE.put(KV_KEY, JSON.stringify(stored));
-  return stored;
-}
+// ---------- request helpers ----------
 
-// ---------- Auth ----------
-
-function constantTimeEq(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-
-function checkAuth(req: Request, env: Env): boolean {
+function tokenFromRequest(req: Request): string | null {
   const header = req.headers.get("Authorization") ?? "";
   const m = /^Bearer\s+(.+)$/.exec(header);
-  if (!m) return false;
-  return constantTimeEq(m[1].trim(), env.FETCH_TOKEN);
+  if (!m) return null;
+  const t = m[1].trim();
+  return t.length > 0 ? t : null;
 }
 
-// ---------- HTTP handler ----------
-
-async function handleGet(env: Env): Promise<Response> {
-  const raw = await env.CERT_STORE.get(KV_KEY);
-  if (!raw) {
-    return new Response(
-      JSON.stringify({ error: "no cert stored yet — POST /refresh or wait for cron" }),
-      { status: 404, headers: { "Content-Type": "application/json" } }
-    );
-  }
-  return new Response(raw, { headers: { "Content-Type": "application/json" } });
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
-async function handleRefresh(env: Env): Promise<Response> {
-  // Crude rate-limit: KV-backed lock with 60s TTL.
-  const locked = await env.CERT_STORE.get(REFRESH_LOCK_KEY);
-  if (locked) {
-    return new Response(
-      JSON.stringify({ error: "refresh rate-limited; try again in <60s" }),
-      { status: 429, headers: { "Content-Type": "application/json" } }
-    );
-  }
-  await env.CERT_STORE.put(REFRESH_LOCK_KEY, "1", { expirationTtl: 60 });
+// ---------- handlers ----------
 
+async function handlePostAccount(req: Request, env: Env, token: string): Promise<Response> {
+  let body: unknown;
   try {
-    const stored = await refreshAndStore(env);
-    return new Response(JSON.stringify(stored), {
-      headers: { "Content-Type": "application/json" },
-    });
+    body = await req.json();
+  } catch {
+    return jsonResponse({ error: "invalid JSON body" }, 400);
+  }
+  if (
+    typeof body !== "object" || body === null ||
+    typeof (body as any).username !== "string" ||
+    typeof (body as any).password !== "string" ||
+    typeof (body as any).otp_secret !== "string"
+  ) {
+    return jsonResponse({ error: "body must be { username, password, otp_secret }" }, 400);
+  }
+  const record: AccountRecord = {
+    username: (body as any).username,
+    password: (body as any).password,
+    otp_secret: (body as any).otp_secret,
+    // no cached_cert yet
+  };
+  const blob = await encryptRecord(record, token, env);
+  await env.CERT_STORE.put(await kvKeyForToken(token, env), blob);
+  return jsonResponse({ stored: true }, 201);
+}
+
+async function handleDeleteAccount(env: Env, token: string): Promise<Response> {
+  await env.CERT_STORE.delete(await kvKeyForToken(token, env));
+  return new Response(null, { status: 204 });
+}
+
+async function handleGetCredential(env: Env, token: string): Promise<Response> {
+  const kvKey = await kvKeyForToken(token, env);
+  const blob = await env.CERT_STORE.get(kvKey);
+  if (!blob) return jsonResponse({ error: "no account for this token" }, 401);
+
+  const record = await decryptRecord(blob, token, env);
+  if (!record) return jsonResponse({ error: "decryption failed (wrong token)" }, 401);
+
+  const now = Date.now();
+  const cached = record.cached_cert;
+  if (cached && now - cached.generated_at < CACHE_LIFETIME_MS) {
+    return jsonResponse(cached);
+  }
+
+  // Stale or missing — refresh from CSCS.
+  let fresh: { key: string; cert: string };
+  try {
+    fresh = await fetchKeysFromCSCS(record);
   } catch (e) {
-    return new Response(
-      JSON.stringify({ error: String(e instanceof Error ? e.message : e) }),
-      { status: 502, headers: { "Content-Type": "application/json" } }
+    return jsonResponse(
+      { error: String(e instanceof Error ? e.message : e) },
+      502,
     );
   }
+
+  record.cached_cert = { key: fresh.key, cert: fresh.cert, generated_at: now };
+  const newBlob = await encryptRecord(record, token, env);
+  await env.CERT_STORE.put(kvKey, newBlob);
+
+  return jsonResponse(record.cached_cert);
 }
+
+// ---------- entrypoint ----------
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -155,17 +279,26 @@ export default {
       return new Response("cscs-key-proxy: OK\n", { headers: { "Content-Type": "text/plain" } });
     }
 
-    if (!checkAuth(req, env)) {
-      return new Response("unauthorized\n", { status: 401 });
+    if (!env.WORKER_PEPPER) {
+      return jsonResponse(
+        { error: "Worker is not configured: WORKER_PEPPER secret is missing" },
+        500,
+      );
     }
 
-    if (url.pathname === "/cert" && req.method === "GET") return handleGet(env);
-    if (url.pathname === "/refresh" && req.method === "POST") return handleRefresh(env);
+    const token = tokenFromRequest(req);
+    if (!token) return jsonResponse({ error: "missing Bearer token" }, 401);
 
-    return new Response("not found\n", { status: 404 });
-  },
+    if (url.pathname === "/account" && req.method === "POST") {
+      return handlePostAccount(req, env, token);
+    }
+    if (url.pathname === "/account" && req.method === "DELETE") {
+      return handleDeleteAccount(env, token);
+    }
+    if (url.pathname === "/credential" && req.method === "GET") {
+      return handleGetCredential(env, token);
+    }
 
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(refreshAndStore(env).then(() => undefined));
+    return jsonResponse({ error: "not found" }, 404);
   },
 };

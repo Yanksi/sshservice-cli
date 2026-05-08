@@ -2,7 +2,7 @@ name = "cscs-key-proxy"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
-# KV namespace holds the latest generated key + cert as a single JSON blob.
+# KV namespace holds per-user encrypted blobs keyed by HMAC(PEPPER, "user:" + token).
 # The id below is a syntactically valid placeholder. The Deploy-to-Cloudflare
 # button provisions a real namespace at deploy time and rewrites this id; for
 # manual `wrangler deploy`, replace it with the value printed by
@@ -11,13 +11,15 @@ compatibility_date = "2024-12-01"
 binding = "CERT_STORE"
 id = "00000000000000000000000000000000"
 
-# Cron: refresh twice a day. CSCS certs are valid for 24h.
-[triggers]
-crons = ["0 */12 * * *"]
-
 # Secrets are *not* declared here (use `wrangler secret put` or the
-# Deploy-to-Cloudflare UI). They are:
-#   CSCS_USERNAME       — your CSCS username
-#   CSCS_PASSWORD       — your CSCS password
-#   CSCS_OTP_SECRET     — your CSCS TOTP secret (base32, the seed — not a 6-digit code)
-#   FETCH_TOKEN         — bearer token clients present to GET /cert and POST /refresh
+# Cloudflare dashboard). The Worker now requires only ONE secret:
+#
+#   WORKER_PEPPER  — 32 bytes of randomness, hex-encoded. Used as the salt
+#                    for HKDF-derived encryption keys and for the HMAC that
+#                    derives KV keys from per-user tokens. Generate once,
+#                    keep stable forever — rotating it makes every existing
+#                    encrypted blob unrecoverable.
+#                    Example: `openssl rand -hex 32`
+#
+# No CSCS credentials are stored at the Worker level: each user POSTs their
+# own credentials encrypted with their own bearer token to /account.
