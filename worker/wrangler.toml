@@ -11,6 +11,12 @@ compatibility_date = "2024-12-01"
 binding = "CERT_STORE"
 id = "00000000000000000000000000000000"
 
+# No cron triggers in the new design — refresh happens lazily on
+# GET /credential. Declared explicitly so wrangler removes any cron left
+# over from a prior deploy of an older version of this Worker.
+[triggers]
+crons = []
+
 # Secrets are *not* declared here (use `wrangler secret put` or the
 # Cloudflare dashboard). The Worker now requires only ONE secret:
 #
