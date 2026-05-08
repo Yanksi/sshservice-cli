@@ -1,4 +1,4 @@
-// Cloudflare Worker — zero-knowledge-style CSCS key proxy.
+// Cloudflare Worker — per-user encrypted CSCS key proxy. (api: v2)
 //
 // Each user POSTs their CSCS credentials encrypted with a token of their
 // choosing; the Worker stores only opaque ciphertext in KV. On GET, the
