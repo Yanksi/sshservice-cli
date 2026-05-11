@@ -40,3 +40,23 @@ crons = []
 #                           random internet hits get 403 before they
 #                           reach KV. Unset means no gate.
 #                           Example: `openssl rand -hex 32`
+
+# Observability — request logs persisted in the Cloudflare dashboard for
+# debugging. Top-level `enabled = false` keeps the umbrella feature off
+# while the sub-blocks opt logs in explicitly; flip the umbrella to
+# `true` to also pick up whatever Cloudflare adds later under this
+# namespace.
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
