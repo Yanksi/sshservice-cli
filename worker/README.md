@@ -54,10 +54,19 @@ across their other machines via this Worker so they don't burn the
   Each entry carries a Cloudflare-enforced TTL — expired entries are
   physically removed by KV, so a `GET` on an expired item returns 404
   by construction.
-- **One Worker secret** — `WORKER_PEPPER`, 32 bytes of randomness in
-  hex. Used only as the HMAC key for index derivation; the Worker does
-  not use it for encryption. Rotating it orphans every existing record
-  (the KV index changes), so treat it as generate-once.
+- **Two Worker secrets:**
+  - `WORKER_PEPPER` (**required**) — 32 bytes of randomness in hex.
+    Used only as the HMAC key for index derivation; the Worker does
+    not use it for encryption. Rotating it orphans every existing
+    record (the KV index changes), so treat it as generate-once.
+  - `WORKER_ACCESS_SECRET` (**optional**) — shared bot-deflector
+    header. When set, every authenticated request must echo it back
+    via `X-Access-Secret: <hex>`; when unset, no gate is applied. The
+    intent is to keep random internet bots from churning your KV
+    write quota — share the value out-of-band with each client that
+    should be allowed to use the Worker. Rotation is just a CF
+    dashboard update plus a re-prompt on each client; it doesn't
+    affect any stored data.
 
 ## HTTP API
 
@@ -65,6 +74,12 @@ All `/item/*` routes require `Authorization: Bearer <token>` where the
 token is whatever the client wants — usually derived client-side from
 the user's passphrase. There is no enrolment step; the first PUT for a
 given token implicitly creates that user's namespace.
+
+When `WORKER_ACCESS_SECRET` is set on the Worker, the same routes also
+require `X-Access-Secret: <hex>` with the matching value. Requests
+missing or mismatching it get `403` before any KV lookup. This gate is
+operator-shared (one value across all clients of a deployment); the
+per-user bearer still controls namespace isolation.
 
 | Method   | Path             | Body          | Behaviour                                                                                                  |
 |----------|------------------|---------------|------------------------------------------------------------------------------------------------------------|
@@ -88,6 +103,9 @@ Cloudflare KV's minimum `expirationTtl`.)
 - `429` on PUT → another writer already stored this name; re-GET, don't
   loop back to upstream a second time.
 - `401` → missing/empty Bearer token.
+- `403` → `WORKER_ACCESS_SECRET` is set and `X-Access-Secret` is
+  missing or wrong. Prompt the user once for the deployment access
+  secret and retry.
 - `400`/`413` → malformed request (bad `ttl`, empty body, body over 64 KiB).
 - `500` → Worker is missing `WORKER_PEPPER`.
 
@@ -120,6 +138,21 @@ The button does not prompt for secrets. Set it manually:
 Until this is set, every authenticated route returns `500` with a
 clear message.
 
+### 2b. (Optional but recommended) set `WORKER_ACCESS_SECRET`
+
+If your Worker URL is reachable from the open internet, set a second
+secret so random bots can't churn writes:
+
+1. Same dashboard path as above.
+2. Name: `WORKER_ACCESS_SECRET`. Value: 32 bytes of randomness in hex.
+3. Share the same value out-of-band with anyone who should be allowed
+   to talk to your Worker. On their first `cscs-keygen.py` run they'll
+   be prompted to paste it; the client caches it locally next to the
+   passphrase.
+
+To rotate: set a new value on the Worker, then have each client run
+once and re-paste at the prompt. No stored data is affected.
+
 ### 3. Hand out the URL to users
 
 Each user generates their own passphrase (e.g. `openssl rand -hex 32`)
@@ -136,8 +169,9 @@ See the top-level README for the client-side flow.
 ```bash
 cd worker
 npm install
-npx wrangler kv namespace create ITEM_STORE   # paste the printed id into wrangler.toml
-npx wrangler secret put WORKER_PEPPER         # paste `openssl rand -hex 32`
+npx wrangler kv namespace create ITEM_STORE          # paste the printed id into wrangler.toml
+npx wrangler secret put WORKER_PEPPER                # paste `openssl rand -hex 32`
+npx wrangler secret put WORKER_ACCESS_SECRET         # optional bot-deflector; paste `openssl rand -hex 32`
 npx wrangler deploy
 ```
 

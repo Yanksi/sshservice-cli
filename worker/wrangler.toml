@@ -19,14 +19,24 @@ id = "2832c9b911d0461eaa02721f2f59ae5b"
 crons = []
 
 # Secrets are *not* declared here (use `wrangler secret put` or the
-# Cloudflare dashboard). The Worker requires exactly ONE secret:
+# Cloudflare dashboard). The Worker reads two secrets:
 #
-#   WORKER_PEPPER  — 32 bytes of randomness, hex-encoded. Used only as
-#                    the HMAC key that derives KV indices from
-#                    (token, name) pairs, so a raw KV dump can't be
-#                    cross-referenced against guessed tokens. The Worker
-#                    does NOT use this for encryption — clients hold the
-#                    encryption key. Rotating PEPPER orphans every
-#                    existing record (the KV index changes) so treat it
-#                    as generate-once.
-#                    Example: `openssl rand -hex 32`
+#   WORKER_PEPPER         — REQUIRED. 32 bytes of randomness, hex-encoded.
+#                           Used only as the HMAC key that derives KV
+#                           indices from (token, name) pairs, so a raw
+#                           KV dump can't be cross-referenced against
+#                           guessed tokens. The Worker does NOT use this
+#                           for encryption — clients hold the encryption
+#                           key. Rotating PEPPER orphans every existing
+#                           record (the KV index changes) so treat it as
+#                           generate-once.
+#                           Example: `openssl rand -hex 32`
+#
+#   WORKER_ACCESS_SECRET  — OPTIONAL. Shared bot-deflector header that
+#                           every authenticated request must echo back
+#                           via `X-Access-Secret`. Set this and share
+#                           the value out-of-band with each client that
+#                           should be allowed to talk to the Worker, so
+#                           random internet hits get 403 before they
+#                           reach KV. Unset means no gate.
+#                           Example: `openssl rand -hex 32`

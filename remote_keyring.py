@@ -57,6 +57,13 @@ class WriteRateLimited(RemoteStoreError):
     upstream refresh."""
 
 
+class AccessDenied(RemoteStoreError):
+    """The Worker returned 403 — its operator has set
+    `WORKER_ACCESS_SECRET` and the value we sent (or didn't send) in
+    `X-Access-Secret` doesn't match. The caller should re-prompt for
+    the deployment access secret and rebuild the store."""
+
+
 @dataclass
 class Item:
     data: bytes
@@ -92,13 +99,25 @@ class RemoteSecretStore:
     construction.
     """
 
-    def __init__(self, endpoint: str, passphrase: str, *, timeout: float = 30.0):
+    def __init__(
+        self,
+        endpoint: str,
+        passphrase: str,
+        *,
+        access_secret: Optional[str] = None,
+        timeout: float = 30.0,
+    ):
         if not endpoint:
             raise ValueError("endpoint required")
         if not passphrase:
             raise ValueError("passphrase required")
         self._endpoint = endpoint.rstrip("/")
         self._bearer, self._enc_key = _derive_keys(passphrase)
+        # access_secret is the deployment-wide bot-deflector header
+        # value. Many Workers won't require it (operator hasn't set
+        # WORKER_ACCESS_SECRET), so this stays Optional and is just
+        # omitted from requests when None.
+        self._access_secret = access_secret or None
         self._timeout = timeout
 
     # The fingerprint identifies which passphrase was used WITHOUT
@@ -139,6 +158,8 @@ class RemoteSecretStore:
         self, method: str, url: str, body: Optional[bytes] = None
     ) -> Tuple[int, bytes, dict]:
         headers = {"Authorization": f"Bearer {self._bearer}"}
+        if self._access_secret is not None:
+            headers["X-Access-Secret"] = self._access_secret
         if body is not None:
             headers["Content-Type"] = "application/octet-stream"
         req = urllib.request.Request(url, data=body, method=method, headers=headers)
@@ -148,6 +169,11 @@ class RemoteSecretStore:
         except urllib.error.HTTPError as e:
             body_bytes = e.read() if e.fp is not None else b""
             hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
+            if e.code == 403:
+                # The deployment gate rejected us. Surface this as a
+                # typed exception so the caller can re-prompt rather
+                # than treating it as a generic store failure.
+                raise AccessDenied(self._err_text(body_bytes) or "access denied")
             return e.code, body_bytes, hdrs
         except urllib.error.URLError as e:
             raise RemoteStoreError(f"{method} {url}: {e.reason}") from e

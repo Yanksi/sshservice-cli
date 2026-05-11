@@ -27,6 +27,12 @@
 export interface Env {
   ITEM_STORE: KVNamespace;
   WORKER_PEPPER: string; // 32+ bytes, hex
+  // Optional deployment-wide gate. When set, all authenticated routes
+  // require X-Access-Secret: <this value>. When unset (the default), no
+  // gate is applied — clients see the same behaviour as the v3.0 release.
+  // Use this to keep random internet bots from churning KV writes; rotate
+  // by replacing this secret and re-pasting it on each client.
+  WORKER_ACCESS_SECRET?: string;
 }
 
 const DEFAULT_TTL_SEC = 24 * 60 * 60;
@@ -67,6 +73,18 @@ async function kvKeyFor(pepperHex: string, token: string, name: string): Promise
   );
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(token + ":" + name));
   return bytesToHex(new Uint8Array(sig));
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  // Char-code XOR loop with no early-out. JS strings differ in length
+  // are rejected up front (no observable timing oracle on length —
+  // length is observable through the response itself anyway).
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 function tokenFromRequest(req: Request): string | null {
@@ -194,6 +212,18 @@ export default {
 
     if (!env.WORKER_PEPPER) {
       return jsonError("Worker is not configured: WORKER_PEPPER secret is missing", 500);
+    }
+
+    // Optional deployment-wide gate. When the operator sets
+    // WORKER_ACCESS_SECRET, every authenticated request must echo it
+    // back in X-Access-Secret. This is the cheap bot-deflector — it
+    // doesn't replace the per-user bearer, it sits in front of it so
+    // random hits never get as far as touching KV.
+    if (env.WORKER_ACCESS_SECRET) {
+      const supplied = req.headers.get("X-Access-Secret") ?? "";
+      if (!constantTimeEqual(supplied, env.WORKER_ACCESS_SECRET)) {
+        return jsonError("missing or invalid X-Access-Secret", 403);
+      }
     }
 
     const token = tokenFromRequest(req);

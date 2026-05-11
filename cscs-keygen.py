@@ -52,6 +52,11 @@ service_id = 'cscs-keygen'
 # devices; the `remote_keyring` module HKDFs it into a bearer token and an
 # AES-GCM key locally.
 remote_service_id = 'cscs-keygen_remote'
+# Service id for the OS-keyring entry that holds the per-endpoint
+# deployment access secret (the WORKER_ACCESS_SECRET bot-deflector).
+# Shared across all users of a given endpoint, so the keyring `account`
+# is the endpoint URL itself rather than a (user, endpoint) tuple.
+remote_access_service_id = 'cscs-keygen_remote_access'
 ssh_folder = Path(os.path.expanduser("~")) / '.ssh'
 priv_key_name = 'cscs-key'
 passphrase_fallback_dir = Path(os.path.expanduser("~")) / '.config' / 'cscs-keygen'
@@ -284,6 +289,102 @@ def _read_passphrase(account):
 def remote_account_label(username, endpoint):
     """Stable label for keyring + fallback file lookups."""
     return f"{username}::{endpoint}"
+
+# ---------- deployment access secret (WORKER_ACCESS_SECRET) ----------
+# Per-endpoint, shared across all users of that endpoint. Cached locally
+# so each device only needs to be prompted once. The Worker decides
+# whether it's required at all (operator sets / unsets the secret on
+# the Worker side); the client only learns about it via a 403 →
+# AccessDenied at runtime.
+
+def _safe_endpoint(endpoint):
+    return ''.join(c if c.isalnum() or c in '-._' else '_' for c in endpoint)
+
+def _access_path(endpoint):
+    return passphrase_fallback_dir / f'access-{_safe_endpoint(endpoint)}'
+
+def _file_access_read(endpoint):
+    fp = _access_path(endpoint)
+    if not fp.exists():
+        return None
+    try:
+        return fp.read_text().strip() or None
+    except Exception:
+        return None
+
+def _file_access_write(endpoint, secret):
+    fp = _access_path(endpoint)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(secret)
+    try:
+        os.chmod(fp, 0o600)
+    except Exception:
+        pass
+
+def _file_access_delete(endpoint):
+    fp = _access_path(endpoint)
+    try:
+        fp.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+def _read_access_secret(endpoint):
+    """OS keyring → file fallback. Returns None if neither holds a value
+    (which is also the steady state for Workers that have no
+    WORKER_ACCESS_SECRET configured)."""
+    s = _keyring_get(remote_access_service_id, endpoint)
+    if s:
+        return s
+    return _file_access_read(endpoint)
+
+def _store_access_secret(endpoint, secret):
+    if _keyring_set(remote_access_service_id, endpoint, secret):
+        print(f"Stored Worker access secret in OS keyring (endpoint={endpoint}).")
+    else:
+        _file_access_write(endpoint, secret)
+        print(f"Stored Worker access secret at {_access_path(endpoint)} (chmod 600).")
+
+def _clear_access_secret(endpoint):
+    _keyring_delete(remote_access_service_id, endpoint)
+    _file_access_delete(endpoint)
+
+def _prompt_access_secret(endpoint):
+    print()
+    print(f"The Worker at {endpoint} requires a deployment access secret (X-Access-Secret).")
+    print("Get this value from whoever runs the Worker.")
+    while True:
+        s = getpass.getpass(f"Access secret for {endpoint}: ").strip()
+        if s:
+            return s
+        print("Input cannot be empty.")
+
+def with_access_retry(endpoint, passphrase, fn):
+    """Call `fn(store)` once with the locally-cached access secret. On
+    AccessDenied (HTTP 403), clear the cache, prompt the operator-shared
+    secret from the user, rebuild the store, and try `fn` exactly once
+    more. The new secret is cached only on a successful retry, so a
+    typo doesn't poison the local cache.
+
+    Use this around every entry point that does real work against the
+    remote keystore (the main refresh loop, the `--delete-account`
+    flow), not around every individual store call — one prompt per
+    invocation, not per HTTP request."""
+    cached = _read_access_secret(endpoint)
+    store = remote_keyring.RemoteSecretStore(endpoint, passphrase, access_secret=cached)
+    try:
+        return fn(store)
+    except remote_keyring.AccessDenied:
+        if cached:
+            print(f"Cached access secret for {endpoint} was rejected by the Worker (403).")
+        # else: nothing was cached — first run on a Worker that has
+        # WORKER_ACCESS_SECRET set. Either way, ask the user.
+        _clear_access_secret(endpoint)
+
+    new_secret = _prompt_access_secret(endpoint)
+    store = remote_keyring.RemoteSecretStore(endpoint, passphrase, access_secret=new_secret)
+    result = fn(store)
+    _store_access_secret(endpoint, new_secret)
+    return result
 
 def _remote_key_name(username):
     """Remote-keyring item name for the cached signed key/cert blob."""
@@ -584,14 +685,15 @@ def do_delete_account(credentials_file, target_username):
         account = remote_account_label(target_username, endpoint)
         passphrase = _read_passphrase(account)
         if passphrase:
-            try:
-                store = remote_keyring.RemoteSecretStore(endpoint, passphrase)
+            def _delete_both(store):
                 for name in (_remote_key_name(target_username), _remote_creds_name(target_username)):
                     try:
                         store.delete(name)
                         print(f"[{target_username}] Deleted remote item `{name}`.")
                     except remote_keyring.RemoteStoreError as e:
                         print(f"[{target_username}] Warning: failed to delete `{name}`: {e}")
+            try:
+                with_access_retry(endpoint, passphrase, _delete_both)
             except remote_keyring.RemoteStoreError as e:
                 print(f"[{target_username}] Warning: could not contact remote keystore at {endpoint}: {e}")
         else:
@@ -658,9 +760,10 @@ def main(credentials_file=None, once=False, force=False, delete_account=None):
                 # refresh from CSCS and push the new one. This makes
                 # `cscs-keygen.py --once` from .bashrc trivial.
                 passphrase, dirty1 = ensure_remote_passphrase(user_entry, endpoint)
-                store = remote_keyring.RemoteSecretStore(endpoint, passphrase)
-                public, private, generated_at, dirty2 = remote_get_or_refresh(
-                    store, user_entry, force=force,
+                public, private, generated_at, dirty2 = with_access_retry(
+                    endpoint,
+                    passphrase,
+                    lambda store: remote_get_or_refresh(store, user_entry, force=force),
                 )
                 had_any_file_secret = had_any_file_secret or dirty1 or dirty2
                 save_keys(public, private, key_name, generated_at)
