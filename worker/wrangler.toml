@@ -2,30 +2,31 @@ name = "cscs-key-proxy"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
-# KV namespace holds per-user encrypted blobs keyed by HMAC(PEPPER, "user:" + token).
+# KV namespace holds opaque client-encrypted blobs keyed by
+# HMAC(PEPPER, token + ":" + name). The Worker never sees plaintext.
 # This id is the namespace provisioned for Yanksi's account when the Worker
 # was first deployed via the button. Anyone forking this repo to deploy their
 # own Worker should replace it with the id printed by
-# `npx wrangler kv namespace create CERT_STORE` against their own account.
+# `npx wrangler kv namespace create ITEM_STORE` against their own account.
 [[kv_namespaces]]
-binding = "CERT_STORE"
+binding = "ITEM_STORE"
 id = "2832c9b911d0461eaa02721f2f59ae5b"
 
-# No cron triggers in the new design — refresh happens lazily on
-# GET /credential. Declared explicitly so wrangler removes any cron left
-# over from a prior deploy of an older version of this Worker.
+# No cron triggers — TTL enforcement is delegated to KV's expirationTtl
+# and refresh is the client's responsibility. Declared explicitly so
+# wrangler removes any cron left over from a prior deploy.
 [triggers]
 crons = []
 
 # Secrets are *not* declared here (use `wrangler secret put` or the
-# Cloudflare dashboard). The Worker now requires only ONE secret:
+# Cloudflare dashboard). The Worker requires exactly ONE secret:
 #
-#   WORKER_PEPPER  — 32 bytes of randomness, hex-encoded. Used as the salt
-#                    for HKDF-derived encryption keys and for the HMAC that
-#                    derives KV keys from per-user tokens. Generate once,
-#                    keep stable forever — rotating it makes every existing
-#                    encrypted blob unrecoverable.
+#   WORKER_PEPPER  — 32 bytes of randomness, hex-encoded. Used only as
+#                    the HMAC key that derives KV indices from
+#                    (token, name) pairs, so a raw KV dump can't be
+#                    cross-referenced against guessed tokens. The Worker
+#                    does NOT use this for encryption — clients hold the
+#                    encryption key. Rotating PEPPER orphans every
+#                    existing record (the KV index changes) so treat it
+#                    as generate-once.
 #                    Example: `openssl rand -hex 32`
-#
-# No CSCS credentials are stored at the Worker level: each user POSTs their
-# own credentials encrypted with their own bearer token to /account.

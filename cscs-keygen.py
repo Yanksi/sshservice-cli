@@ -6,6 +6,7 @@
 #     "pyotp",
 #     "requests==2.25.1",
 #     "keyring",
+#     "cryptography>=42",
 # ]
 # ///
 
@@ -40,18 +41,30 @@ from pathlib import Path
 import psutil
 import argparse
 import keyring
+import remote_keyring
 # from progress.bar import IncrementalBar
 
 #Variables:
 api_get_keys = 'https://sshservice.cscs.ch/api/v1/auth/ssh-keys/signed-key'
 service_id = 'cscs-keygen'
-proxy_service_id = 'cscs-keygen_proxy'
+# Service id for the local OS-keyring entry that holds the per-(user,endpoint)
+# passphrase. The passphrase is the one secret the user types/copies between
+# devices; the `remote_keyring` module HKDFs it into a bearer token and an
+# AES-GCM key locally.
+remote_service_id = 'cscs-keygen_remote'
 ssh_folder = Path(os.path.expanduser("~")) / '.ssh'
 priv_key_name = 'cscs-key'
-proxy_token_fallback_dir = Path(os.path.expanduser("~")) / '.config' / 'cscs-keygen'
+passphrase_fallback_dir = Path(os.path.expanduser("~")) / '.config' / 'cscs-keygen'
+
+# TTLs on the remote keyring side. CSCS-signed certs are valid 24h, so we
+# expire the cached key just under that and let the client refresh. The
+# login credentials live much longer — they only change when CSCS forces
+# a password / TOTP reset, which is rare.
+KEY_TTL_SECONDS = 23 * 60 * 60
+CREDS_TTL_SECONDS = 90 * 24 * 60 * 60
 
 # Sentinel value used in the `endpoint` field to mean "talk to CSCS directly".
-# Anything else is treated as a proxy URL.
+# Anything else is treated as a remote-keystore URL.
 DIRECT_ENDPOINT = 'cscs'
 
 #Methods:
@@ -95,8 +108,12 @@ def resolve_endpoint(user_entry, default_endpoint):
     """Per-user `endpoint` overrides the top-level default."""
     return user_entry.get('endpoint') or default_endpoint or DIRECT_ENDPOINT
 
-def is_proxy_endpoint(endpoint):
+def is_remote_endpoint(endpoint):
     return endpoint and endpoint != DIRECT_ENDPOINT
+
+
+# Old alias kept for callers that haven't been renamed yet.
+is_proxy_endpoint = is_remote_endpoint
 
 def save_config_file(fname, default_endpoint, users, legacy):
     """Persist non-secret config back to disk. Secrets live only in the keyring
@@ -201,7 +218,7 @@ def _keyring_set(service, account, secret):
         keyring.set_password(service, account, secret)
         return True
     except Exception as e:
-        print(f"Keyring unavailable ({e}); falling back to {proxy_token_fallback_dir}.")
+        print(f"Keyring unavailable ({e}); falling back to {passphrase_fallback_dir}.")
         return False
 
 def _keyring_get(service, account):
@@ -218,14 +235,14 @@ def _keyring_delete(service, account):
     except Exception:
         pass
 
-def _proxy_token_path(account):
+def _passphrase_path(account):
     """Per-account file path for the keyring fallback."""
     # Use a stable, filesystem-safe filename derived from the account label.
     safe = ''.join(c if c.isalnum() or c in '-._' else '_' for c in account)
-    return proxy_token_fallback_dir / f'token-{safe}'
+    return passphrase_fallback_dir / f'passphrase-{safe}'
 
-def _file_token_read(account):
-    fp = _proxy_token_path(account)
+def _file_passphrase_read(account):
+    fp = _passphrase_path(account)
     if not fp.exists():
         return None
     try:
@@ -233,225 +250,253 @@ def _file_token_read(account):
     except Exception:
         return None
 
-def _file_token_write(account, token):
-    fp = _proxy_token_path(account)
+def _file_passphrase_write(account, passphrase):
+    fp = _passphrase_path(account)
     fp.parent.mkdir(parents=True, exist_ok=True)
-    fp.write_text(token)
+    fp.write_text(passphrase)
     try:
         os.chmod(fp, 0o600)
     except Exception:
         pass
 
-def _file_token_delete(account):
-    fp = _proxy_token_path(account)
+def _file_passphrase_delete(account):
+    fp = _passphrase_path(account)
     try:
         fp.unlink(missing_ok=True)
     except Exception:
         pass
 
-def _store_proxy_token(account, token):
-    """Save token to keyring; fall back to chmod-600 file if keyring is unavailable."""
-    if _keyring_set(proxy_service_id, account, token):
-        print(f"Stored proxy token in keyring (account={account}).")
+def _store_passphrase(account, passphrase):
+    """Save passphrase to keyring; fall back to chmod-600 file if keyring is unavailable."""
+    if _keyring_set(remote_service_id, account, passphrase):
+        print(f"Stored remote keyring passphrase in OS keyring (account={account}).")
     else:
-        _file_token_write(account, token)
-        print(f"Stored proxy token at {_proxy_token_path(account)} (chmod 600).")
+        _file_passphrase_write(account, passphrase)
+        print(f"Stored remote keyring passphrase at {_passphrase_path(account)} (chmod 600).")
 
-def _read_proxy_token(account):
-    """Look up the proxy token by account label. Returns None if not present."""
-    t = _keyring_get(proxy_service_id, account)
+def _read_passphrase(account):
+    """Look up the passphrase by account label. Returns None if not present."""
+    t = _keyring_get(remote_service_id, account)
     if t:
         return t
-    return _file_token_read(account)
+    return _file_passphrase_read(account)
 
-def proxy_account_label(username, endpoint):
+def remote_account_label(username, endpoint):
     """Stable label for keyring + fallback file lookups."""
     return f"{username}::{endpoint}"
 
-def register_proxy_account(endpoint, token, username, password, otp_secret):
-    """POST /account to the proxy worker. Stores encrypted CSCS credentials there."""
-    url = endpoint.rstrip('/') + '/account'
-    print(f"[{username}] Registering account on proxy {url}")
-    try:
-        resp = requests.post(
-            url,
-            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-            data=json.dumps({'username': username, 'password': password, 'otp_secret': otp_secret}),
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as e:
-        sys.exit(f"Error: proxy registration failed: {e}")
-    if not resp.ok:
+def _remote_key_name(username):
+    """Remote-keyring item name for the cached signed key/cert blob."""
+    return f"cscs/{username}/key"
+
+def _remote_creds_name(username):
+    """Remote-keyring item name for the encrypted CSCS login credentials."""
+    return f"cscs/{username}/creds"
+
+def _prompt_cscs_password(username):
+    return getpass.getpass(f"[{username}] CSCS password: ")
+
+def _prompt_otp_secret(username):
+    """Prompt until the user supplies a valid base32 TOTP seed."""
+    while True:
+        inp = getpass.getpass(
+            f"[{username}] CSCS TOTP secret (base32 seed, NOT a 6-digit code): "
+        ).strip()
+        if not inp:
+            print("Input cannot be empty.")
+            continue
         try:
-            err = resp.json().get('error', resp.text)
+            pyotp.TOTP(inp).now()
         except Exception:
-            err = resp.text
-        sys.exit(f"Error: proxy returned HTTP {resp.status_code}: {err}")
+            print("That doesn't look like a valid base32 TOTP seed. Try again.")
+            continue
+        return inp
 
-def delete_proxy_account(endpoint, token):
-    """DELETE /account on the proxy worker. Best-effort; logs but doesn't raise
-    on non-2xx server responses (the local token cleanup happens regardless)."""
-    url = endpoint.rstrip('/') + '/account'
-    print(f"Deleting account on proxy {url}")
-    try:
-        resp = requests.delete(url, headers={'Authorization': f'Bearer {token}'}, timeout=15)
-    except requests.exceptions.RequestException as e:
-        print(f"Warning: proxy delete request failed: {e}")
-        return
-    # 204 = deleted; 401 = wrong/expired token (nothing to delete with this token anyway).
-    if resp.status_code in (200, 204, 401):
-        return
-    try:
-        err = resp.json().get('error', resp.text)
-    except Exception:
-        err = resp.text
-    print(f"Warning: proxy returned HTTP {resp.status_code} on delete: {err}")
-
-def fetch_keys_from_proxy(endpoint, token, force=False):
-    """GET /credential from the proxy worker. Returns (public_cert, private_key, generated_at_ms).
-
-    generated_at_ms is when the worker fetched the cert from CSCS, used to anchor
-    local mtime to the CSCS-side creation time instead of this fetch time.
-
-    If `force` is True, appends ?force=1 so the worker bypasses its own cache
-    and always hits CSCS — for use after revoking the cert in the CSCS
-    dashboard. The worker rate-limits force-refresh to 1/min per token."""
-    url = endpoint.rstrip('/') + '/credential'
-    if force:
-        url += '?force=1'
-    print(f"Fetching keys from proxy {url}")
-    try:
-        resp = requests.get(url, headers={'Authorization': f'Bearer {token}'}, timeout=30)
-    except requests.exceptions.RequestException as e:
-        sys.exit(f"Error: proxy fetch failed: {e}")
-    if resp.status_code == 401:
-        sys.exit(
-            "Error: proxy rejected token. The local token may be stale; delete the keyring entry "
-            f"`{proxy_service_id}` for this user and re-run to re-register."
-        )
-    if resp.status_code == 429:
-        sys.exit(
-            "Error: proxy rate-limited the force-refresh. Wait up to 60s before retrying with --force, "
-            "or drop --force to read the currently-cached cert."
-        )
-    if not resp.ok:
-        try:
-            err = resp.json().get('error', resp.text)
-        except Exception:
-            err = resp.text
-        sys.exit(f"Error: proxy returned HTTP {resp.status_code}: {err}")
-    body = resp.json()
-    if not body.get('cert') or not body.get('key'):
-        sys.exit("Error: proxy returned no cert/key.")
-    generated_at = body.get('generated_at')
-    if not isinstance(generated_at, (int, float)):
-        generated_at = None
-    return body['cert'], body['key'], generated_at
-
-def ensure_proxy_account(user_entry, endpoint):
-    """Ensure the worker has an account for this user. Returns (token, file_dirty).
+def ensure_remote_passphrase(user_entry, endpoint):
+    """Resolve (or freshly generate) the per-(user, endpoint) remote-keyring
+    passphrase. Returns (passphrase, file_dirty).
 
     Resolution order:
-      1. Existing token cached locally for (username, endpoint).
-      2. Token explicitly provided in the config file (e.g. copied over from
-         another device that already registered). Migrated to local store and
-         stripped from the file.
-      3. Register a fresh account: gather password + OTP seed (file →
-         direct-mode keyring → interactive prompt fallback), generate a 256-bit
-         bearer token, POST /account, store the token. The token is printed to
-         stdout so the user can re-use it on other devices, and any
-         locally-cached direct-mode password / OTP keyring entries are erased
-         since they now live only on the worker.
+      1. Cached locally in the OS keyring (or chmod-600 fallback file).
+      2. Provided in the credential file under `passphrase` — adopted into
+         local storage and stripped from the file.
+      3. (Legacy) provided in the credential file under `token` — adopted as
+         the passphrase. Old multi-device setups copied a `token` between
+         devices; we accept it under the new name so users don't have to
+         hand-edit every credential.json.
+      4. Generate a fresh 256-bit random passphrase, print it once so the
+         user can copy it to their other devices, and store it locally.
     """
     username = user_entry['username']
-    account = proxy_account_label(username, endpoint)
+    account = remote_account_label(username, endpoint)
     file_dirty = False
 
-    existing = _read_proxy_token(account)
+    existing = _read_passphrase(account)
     if existing:
-        # Defensive cleanup: if the file still has plaintext secrets from a
-        # previous setup, strip them now that the token is local.
-        leftover_keys = [k for k in ('password', 'otp_secret', 'token') if k in user_entry]
-        if leftover_keys:
-            for k in leftover_keys:
+        # Defensive cleanup: strip anything secret-shaped from the file now
+        # that the passphrase lives in the local keyring/fallback.
+        leftover = [k for k in ('password', 'otp_secret', 'token', 'passphrase') if k in user_entry]
+        if leftover:
+            for k in leftover:
                 user_entry.pop(k, None)
             file_dirty = True
         return existing, file_dirty
 
-    # Path 2: token supplied in the file (user shared it from another device).
-    if user_entry.get('token'):
-        token = user_entry.pop('token')
+    # Path 2 / 3: passphrase supplied in the file (copied from another device).
+    supplied = user_entry.pop('passphrase', None) or user_entry.pop('token', None)
+    if supplied:
         file_dirty = True
-        _store_proxy_token(account, token)
-        print(f"[{username}] Adopted token from credential file; will fetch using existing proxy account.")
-        return token, file_dirty
+        _store_passphrase(account, supplied)
+        print(f"[{username}] Adopted remote-keyring passphrase from credential file.")
+        return supplied, file_dirty
 
-    # Path 3: register a new account.
-    print(f"[{username}] No proxy token cached locally for {endpoint}; registering a new account.")
+    # Path 4: brand new account on this device — generate and announce.
+    print(f"[{username}] No remote-keyring passphrase cached locally for {endpoint}; generating a fresh one.")
+    passphrase = secrets.token_urlsafe(32)
+    _store_passphrase(account, passphrase)
 
-    # Resolve password.
+    border = "=" * 70
+    print()
+    print(border)
+    print(f"[{username}] Generated a new remote-keyring passphrase for {endpoint}.")
+    print(f"[{username}] Copy this to any OTHER device that should share the same cached key:")
+    print()
+    print(f"    {passphrase}")
+    print()
+    print(f"[{username}] On another device, add it under this user's entry in credential.json:")
+    print(f'[{username}]   {{ "username": "{username}", "endpoint": "{endpoint}", "passphrase": "<paste>" }}')
+    print(f"[{username}] The passphrase moves to the local keyring on first run and is stripped from the file.")
+    print(border)
+    print()
+    return passphrase, file_dirty
+
+def remote_ensure_creds(store, user_entry):
+    """Make sure CSCS login credentials exist on the remote keyring for this
+    user, prompting + uploading them if absent. Returns (password, otp_secret,
+    file_dirty).
+
+    Sources, in order:
+      1. The remote keyring (decrypted client-side).
+      2. The credential file (password / otp_secret keys), then promoted to
+         the remote keyring with a long TTL and stripped from the file.
+      3. The local direct-mode OS-keyring entries.
+      4. Interactive prompt.
+    """
+    username = user_entry['username']
+    file_dirty = False
+
+    item = store.get_json(_remote_creds_name(username))
+    if isinstance(item, dict) and item.get('password') and item.get('otp_secret'):
+        return item['password'], item['otp_secret'], file_dirty
+
+    # Need to seed the remote keyring with creds. Gather them locally.
     if 'password' in user_entry:
         password = user_entry.pop('password')
         file_dirty = True
     else:
         password = keyring.get_password(service_id, username)
         if not password:
-            password = getpass.getpass(f"[{username}] CSCS password: ")
+            password = _prompt_cscs_password(username)
 
-    # Resolve OTP secret. Must be a TOTP seed (base32), not a 6-digit code,
-    # because the worker generates fresh codes on every refresh.
     if 'otp_secret' in user_entry:
         otp_secret = user_entry.pop('otp_secret')
         file_dirty = True
     else:
         otp_secret = keyring.get_password(service_id + "_otp", username)
         if not otp_secret:
-            while True:
-                inp = getpass.getpass(
-                    f"[{username}] CSCS TOTP secret (base32 seed, NOT a 6-digit code): "
-                ).strip()
-                if not inp:
-                    print("Input cannot be empty.")
-                    continue
-                try:
-                    pyotp.TOTP(inp).now()
-                except Exception:
-                    print("That doesn't look like a valid base32 TOTP seed. Try again.")
-                    continue
-                otp_secret = inp
-                break
+            otp_secret = _prompt_otp_secret(username)
 
-    # Validate the OTP secret one last time, regardless of source.
+    # Validate the OTP secret before storing, regardless of source — a bad
+    # secret here will fail every subsequent refresh, so fail fast.
     try:
         pyotp.TOTP(otp_secret).now()
     except Exception as e:
         sys.exit(f"Error: stored OTP secret is not valid base32: {e}")
 
-    token = secrets.token_urlsafe(32)
-    register_proxy_account(endpoint, token, username, password, otp_secret)
-    _store_proxy_token(account, token)
+    print(f"[{username}] Storing CSCS credentials on remote keyring (encrypted client-side).")
+    try:
+        store.set_json(
+            _remote_creds_name(username),
+            {'password': password, 'otp_secret': otp_secret},
+            ttl=CREDS_TTL_SECONDS,
+        )
+    except remote_keyring.WriteRateLimited:
+        # Highly unusual on the creds path (this only runs at first setup
+        # or after creds expiry), but treat it as harmless: another device
+        # just pushed the same thing.
+        print(f"[{username}] Remote creds were updated by another device concurrently; using what's there.")
+    except remote_keyring.RemoteStoreError as e:
+        sys.exit(f"Error: failed to push CSCS credentials to remote keyring: {e}")
 
-    # Print the token so the user can re-use this account on other devices.
-    # It's the only time we surface the token in plaintext.
-    border = "=" * 70
-    print()
-    print(border)
-    print(f"[{username}] Registered new proxy account on {endpoint}")
-    print(f"[{username}] Proxy token (save this to use the SAME account on other devices):")
-    print()
-    print(f"    {token}")
-    print()
-    print(f"[{username}] On another device, add it under this user's entry in credential.json:")
-    print(f'[{username}]   {{ "username": "{username}", "endpoint": "{endpoint}", "token": "<paste>" }}')
-    print(f"[{username}] The token will be moved to the keyring on first run and stripped from the file.")
-    print(border)
-    print()
-
-    # Wipe locally-cached CSCS secrets for this user — they only live on the worker now.
+    # Wipe locally-cached CSCS secrets for this user — they only live on the
+    # remote keyring now.
     _keyring_delete(service_id, username)
     _keyring_delete(service_id + "_otp", username)
 
-    return token, file_dirty
+    return password, otp_secret, file_dirty
+
+def remote_get_or_refresh(store, user_entry, force=False):
+    """Resolve a usable signed key for `user_entry`, refreshing from CSCS if
+    necessary. Returns (public_cert, private_key, generated_at_ms, file_dirty).
+
+    Flow:
+      1. If not `force`, GET cscs/<user>/key from the remote keyring. On hit,
+         return the cached blob.
+      2. On miss (404, KV has evicted for expiry), fetch CSCS login creds
+         (from the remote keyring or, on first run, locally) and call CSCS
+         to mint a fresh key.
+      3. PUT the new key back to the remote keyring with KEY_TTL_SECONDS.
+         If another refresher beat us to the punch (HTTP 429 from the
+         Worker), re-GET to pick up the value they just wrote instead of
+         hammering CSCS again.
+    """
+    username = user_entry['username']
+    key_item_name = _remote_key_name(username)
+
+    if not force:
+        cached = store.get_json(key_item_name)
+        if isinstance(cached, dict) and cached.get('public') and cached.get('private'):
+            print(f"[{username}] Using cached signed key from remote keyring.")
+            return (
+                cached['public'],
+                cached['private'],
+                cached.get('generated_at'),
+                False,
+            )
+
+    # Refresh path.
+    password, otp_secret, file_dirty = remote_ensure_creds(store, user_entry)
+    otp = pyotp.TOTP(otp_secret).now()
+    public, private = get_keys(username, password, otp)
+    generated_at_ms = int(time.time() * 1000)
+
+    try:
+        store.set_json(
+            key_item_name,
+            {'public': public, 'private': private, 'generated_at': generated_at_ms},
+            ttl=KEY_TTL_SECONDS,
+        )
+        print(f"[{username}] Pushed fresh signed key to remote keyring (TTL {KEY_TTL_SECONDS}s).")
+    except remote_keyring.WriteRateLimited:
+        # Another device just pushed; trust their write over ours rather
+        # than burning a second slot in the CSCS 5-key quota.
+        print(f"[{username}] Another device just pushed a fresh key; using theirs.")
+        cached = store.get_json(key_item_name)
+        if isinstance(cached, dict) and cached.get('public') and cached.get('private'):
+            return (
+                cached['public'],
+                cached['private'],
+                cached.get('generated_at'),
+                file_dirty,
+            )
+        # Race lost but the winner's blob already vanished or won't decrypt:
+        # fall through with our own freshly-minted pair.
+    except remote_keyring.RemoteStoreError as e:
+        # Non-rate-limit errors are unusual — log but still use our local
+        # copy, since the user already has a working cert.
+        print(f"[{username}] Warning: failed to push key to remote keyring: {e}")
+
+    return public, private, generated_at_ms, file_dirty
 
 def get_keys(username, password, otp):
     print(f"[{username}] Fetching keys from CSCS...")
@@ -522,9 +567,9 @@ def key_invalid_after(priv_key_f):
     return max(86400 - (curr_time - modified_time), 0) # number of seconds left for the key to expire
 
 def do_delete_account(credentials_file, target_username):
-    """DELETE the proxy account for `target_username` (server-side + local token).
-    After this, the next normal run will re-register from scratch using whatever
-    password / OTP secret is in the file or prompted interactively."""
+    """Tear down the remote-keyring entries for `target_username` and clear the
+    locally-cached passphrase. After this, the next normal run will generate
+    a fresh passphrase, prompt for CSCS credentials, and push them anew."""
     default_endpoint, users, legacy = load_config(credentials_file)
     matched = [u for u in users if u.get('username') == target_username]
     if not matched:
@@ -532,23 +577,31 @@ def do_delete_account(credentials_file, target_username):
 
     for user_entry in matched:
         endpoint = resolve_endpoint(user_entry, default_endpoint)
-        if not is_proxy_endpoint(endpoint):
-            print(f"[{target_username}] endpoint is `{endpoint}`, not a proxy URL — nothing to delete.")
+        if not is_remote_endpoint(endpoint):
+            print(f"[{target_username}] endpoint is `{endpoint}`, not a remote-keystore URL — nothing to delete.")
             continue
 
-        account = proxy_account_label(target_username, endpoint)
-        token = _read_proxy_token(account)
-        if token:
-            delete_proxy_account(endpoint, token)
-            print(f"[{target_username}] Server-side account on {endpoint} cleared.")
+        account = remote_account_label(target_username, endpoint)
+        passphrase = _read_passphrase(account)
+        if passphrase:
+            try:
+                store = remote_keyring.RemoteSecretStore(endpoint, passphrase)
+                for name in (_remote_key_name(target_username), _remote_creds_name(target_username)):
+                    try:
+                        store.delete(name)
+                        print(f"[{target_username}] Deleted remote item `{name}`.")
+                    except remote_keyring.RemoteStoreError as e:
+                        print(f"[{target_username}] Warning: failed to delete `{name}`: {e}")
+            except remote_keyring.RemoteStoreError as e:
+                print(f"[{target_username}] Warning: could not contact remote keystore at {endpoint}: {e}")
         else:
-            print(f"[{target_username}] No local token for {endpoint}; skipping server-side DELETE.")
+            print(f"[{target_username}] No local passphrase for {endpoint}; skipping server-side DELETE.")
 
-        # Always wipe local token storage, even if the server response was iffy:
+        # Always wipe local passphrase storage, even if the server response was iffy:
         # the user asked us to forget this credential locally.
-        _keyring_delete(proxy_service_id, account)
-        _file_token_delete(account)
-        print(f"[{target_username}] Local token store cleared.")
+        _keyring_delete(remote_service_id, account)
+        _file_passphrase_delete(account)
+        print(f"[{target_username}] Local passphrase cleared.")
 
 def main(credentials_file=None, once=False, force=False, delete_account=None):
     if delete_account:
@@ -596,15 +649,20 @@ def main(credentials_file=None, once=False, force=False, delete_account=None):
             username = user_entry['username']
             key_name = resolve_key_name(user_entry, legacy)
 
-            if is_proxy_endpoint(endpoint):
-                # Proxy users always fetch — the worker handles its own
-                # 23h cache, so the local mtime gate is redundant. This
-                # also makes `cscs-keygen.py --once` from .bashrc trivial:
-                # every shell start ends up with the worker's current
-                # cert, no "did I refresh recently?" reasoning required.
-                token, dirty = ensure_proxy_account(user_entry, endpoint)
-                had_any_file_secret = had_any_file_secret or dirty
-                public, private, generated_at = fetch_keys_from_proxy(endpoint, token, force=force)
+            if is_remote_endpoint(endpoint):
+                # Remote-keyring users skip the local mtime gate: the
+                # server enforces the cached key's TTL (its GET returns
+                # 404 once expired), so we ask for the current key on
+                # every invocation. If it's still valid we get it back
+                # in one round-trip; if it isn't, we transparently
+                # refresh from CSCS and push the new one. This makes
+                # `cscs-keygen.py --once` from .bashrc trivial.
+                passphrase, dirty1 = ensure_remote_passphrase(user_entry, endpoint)
+                store = remote_keyring.RemoteSecretStore(endpoint, passphrase)
+                public, private, generated_at, dirty2 = remote_get_or_refresh(
+                    store, user_entry, force=force,
+                )
+                had_any_file_secret = had_any_file_secret or dirty1 or dirty2
                 save_keys(public, private, key_name, generated_at)
                 print(f"[{username}] Keys saved to {ssh_folder / key_name}")
             else:
@@ -659,7 +717,8 @@ if __name__ == "__main__":
     parser.add_argument('--force', action='store_true', help='Force the script to run even if the key is still valid')
     parser.add_argument('--credentials', type=str, help='Path to the credentials file', default=Path(__file__).parent / 'credential.json')
     parser.add_argument('--delete-account', metavar='USERNAME', type=str,
-                        help='DELETE the proxy account for USERNAME on the worker and clear the local token, then exit. '
-                             'Re-register by running again with password / otp_secret in credential.json or interactively.')
+                        help='Tear down the remote-keyring entries (CSCS credentials and cached key) '
+                             'for USERNAME, clear the locally cached passphrase, then exit. The next '
+                             'normal run will generate a fresh passphrase and re-prompt for CSCS credentials.')
     args = parser.parse_args()
     exit(main(args.credentials, args.once, args.force, args.delete_account))
