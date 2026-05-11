@@ -1,7 +1,7 @@
 $scriptPath = $PSScriptRoot
 $scriptFilePy = Join-Path -Path $scriptPath -ChildPath "cscs-keygen.py"
 
-$pyOutput = & uv run $scriptFilePy --once
+$pyOutput = & uv run $scriptFilePy
 
 # Match the validity line specifically — earlier digits (chmod 600, ports in
 # URLs, digits in usernames/paths) would otherwise be picked up by a bare \d+.
