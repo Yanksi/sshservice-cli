@@ -157,7 +157,15 @@ class RemoteSecretStore:
     def _request(
         self, method: str, url: str, body: Optional[bytes] = None
     ) -> Tuple[int, bytes, dict]:
-        headers = {"Authorization": f"Bearer {self._bearer}"}
+        headers = {
+            # urllib's default User-Agent ("Python-urllib/X.Y") trips
+            # Cloudflare's Bot Fight Mode on workers.dev routes, which
+            # returns a 1010 error page that looks indistinguishable
+            # from a real 403 from the Worker. Identify ourselves
+            # explicitly so the edge passes us through to the Worker.
+            "User-Agent": "cscs-keygen/3.0 (+https://github.com/Yanksi/sshservice-cli)",
+            "Authorization": f"Bearer {self._bearer}",
+        }
         if self._access_secret is not None:
             headers["X-Access-Secret"] = self._access_secret
         if body is not None:
@@ -170,10 +178,22 @@ class RemoteSecretStore:
             body_bytes = e.read() if e.fp is not None else b""
             hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
             if e.code == 403:
-                # The deployment gate rejected us. Surface this as a
-                # typed exception so the caller can re-prompt rather
-                # than treating it as a generic store failure.
-                raise AccessDenied(self._err_text(body_bytes) or "access denied")
+                err = self._err_text(body_bytes) or "access denied"
+                # `error code: 1010` (and friends) come from Cloudflare's
+                # edge firewall, NOT from the Worker's WORKER_ACCESS_SECRET
+                # check. Re-prompting for an access secret won't help —
+                # surface it as a plain RemoteStoreError so callers don't
+                # loop on it.
+                if "error code:" in err.lower() or "<!doctype html" in err.lower():
+                    raise RemoteStoreError(
+                        f"Cloudflare edge rejected the request (HTTP 403, body: {err[:120]!r}). "
+                        f"This is a firewall / Bot Fight Mode hit, not the Worker — check the "
+                        f"Cloudflare dashboard's Security settings for this Worker."
+                    )
+                # Real Worker 403 — the deployment gate rejected us. Surface
+                # this typed so the caller can re-prompt for the access
+                # secret rather than treating it as a generic store failure.
+                raise AccessDenied(err)
             return e.code, body_bytes, hdrs
         except urllib.error.URLError as e:
             raise RemoteStoreError(f"{method} {url}: {e.reason}") from e
