@@ -37,10 +37,13 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import keyring as _keyring
+from keyring.errors import KeyringError as _KeyringError
 
 import remote_keyring as _remote_keyring
 
@@ -54,6 +57,78 @@ _REMOTE_CONFIG_ACCOUNT = "config"
 # dedicated service prevents collisions with anything the host
 # application stores directly via `keyring.set_password`.
 _LOCAL_SERVICE = "ttl_keyring.local"
+
+# File fallback root, used on hosts where `keyring` has no usable backend
+# (headless Linux, cluster login nodes — anything where Secret Service /
+# Keychain / Credential Manager isn't available and the library falls
+# through to its `fail` backend). The fallback files mirror the
+# (service, account) layout one-to-one with chmod 0600.
+_FALLBACK_ROOT = Path(os.path.expanduser("~")) / ".config" / "ttl-keyring"
+
+
+# ---------- low-level (service, account) -> str storage ----------
+# `keyring` raises NoKeyringError (a subclass of KeyringError) when no
+# native backend is available. We catch the base class so any backend
+# init failure routes us to the file fallback — getting *some* secret
+# storage is better than failing the whole tool on a cluster node.
+
+
+def _safe(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "-._" else "_" for c in s)
+
+
+def _fallback_path(service: str, account: str) -> Path:
+    return _FALLBACK_ROOT / _safe(service) / _safe(account)
+
+
+def _kv_set(service: str, account: str, value: str) -> None:
+    try:
+        _keyring.set_password(service, account, value)
+        return
+    except _KeyringError:
+        pass
+    p = _fallback_path(service, account)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(value)
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        # Windows / restricted filesystem — POSIX chmod is meaningless
+        # there. NTFS ACLs would be the analogous mechanism, but the
+        # native keyring path is taken on Windows anyway, so we only
+        # hit this branch on Unix where chmod always works.
+        pass
+
+
+def _kv_get(service: str, account: str) -> Optional[str]:
+    try:
+        v = _keyring.get_password(service, account)
+        if v is not None:
+            return v
+    except _KeyringError:
+        pass
+    p = _fallback_path(service, account)
+    if not p.exists():
+        return None
+    try:
+        return p.read_text() or None
+    except OSError:
+        return None
+
+
+def _kv_delete(service: str, account: str) -> None:
+    try:
+        _keyring.delete_password(service, account)
+    except Exception:
+        # `delete_password` raises on missing entries on some backends
+        # AND on backends that don't exist — both are non-fatal here
+        # since the post-condition ("no entry") still holds.
+        pass
+    p = _fallback_path(service, account)
+    try:
+        p.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ---------- typed errors ----------
@@ -106,13 +181,13 @@ def configure_remote(
         },
         separators=(",", ":"),
     )
-    _keyring.set_password(_REMOTE_CONFIG_SERVICE, _REMOTE_CONFIG_ACCOUNT, blob)
+    _kv_set(_REMOTE_CONFIG_SERVICE, _REMOTE_CONFIG_ACCOUNT, blob)
 
 
 def get_remote_config() -> Optional[dict]:
     """Return ``{"endpoint", "passphrase", "access_secret"}`` if present,
     else ``None``."""
-    raw = _keyring.get_password(_REMOTE_CONFIG_SERVICE, _REMOTE_CONFIG_ACCOUNT)
+    raw = _kv_get(_REMOTE_CONFIG_SERVICE, _REMOTE_CONFIG_ACCOUNT)
     if not raw:
         return None
     try:
@@ -130,12 +205,7 @@ def get_remote_config() -> Optional[dict]:
 def clear_remote_config() -> None:
     """Drop the saved remote config. Idempotent — safe to call when no
     config is set."""
-    try:
-        _keyring.delete_password(_REMOTE_CONFIG_SERVICE, _REMOTE_CONFIG_ACCOUNT)
-    except Exception:
-        # `keyring.delete_password` raises on missing entries on some
-        # backends; treat as a no-op since the post-condition holds.
-        pass
+    _kv_delete(_REMOTE_CONFIG_SERVICE, _REMOTE_CONFIG_ACCOUNT)
 
 
 # ---------- backends ----------
@@ -166,7 +236,7 @@ class _LocalBackend(_Backend):
     name = "local"
 
     def get(self, name: str) -> Optional[bytes]:
-        raw = _keyring.get_password(_LOCAL_SERVICE, name)
+        raw = _kv_get(_LOCAL_SERVICE, name)
         if not raw:
             return None
         try:
@@ -195,13 +265,10 @@ class _LocalBackend(_Backend):
             },
             separators=(",", ":"),
         )
-        _keyring.set_password(_LOCAL_SERVICE, name, blob)
+        _kv_set(_LOCAL_SERVICE, name, blob)
 
     def delete(self, name: str) -> None:
-        try:
-            _keyring.delete_password(_LOCAL_SERVICE, name)
-        except Exception:
-            pass
+        _kv_delete(_LOCAL_SERVICE, name)
 
 
 class _RemoteBackend(_Backend):

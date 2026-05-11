@@ -31,7 +31,10 @@ Each user in `credential.json` picks the backend via an `endpoint`:
 
 Nothing sensitive lives in `credential.json`. Passwords, TOTP seeds,
 remote passphrases, and deployment access secrets all live in the OS
-keyring.
+keyring — or, on hosts where no OS keyring backend is available
+(headless Linux, CSCS login nodes), in chmod-600 files under
+`~/.config/ttl-keyring/`. The fallback kicks in automatically when
+`keyring` raises `NoKeyringError`; the rest of the code is unaware.
 
 ## Setup
 
